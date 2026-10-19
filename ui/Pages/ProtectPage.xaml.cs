@@ -1,0 +1,644 @@
+using System.Collections.ObjectModel;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Navigation;
+using NovaProtect.UI.Models;
+using NovaProtect.UI.Services;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.Storage;
+using Windows.Storage.Pickers;
+using WinRT.Interop;
+
+namespace NovaProtect.UI.Pages;
+
+public sealed partial class ProtectPage : Page
+{
+    private readonly ProtectorService _protector = new();
+    private readonly ObservableCollection<string> _virtualFiles = [];
+    private readonly ObservableCollection<ProtectionObjectRule> _markerRules = [];
+    private CancellationTokenSource? _runCancellation;
+    private PeSummary? _peSummary;
+    private bool _settingDefaultOutput;
+    private bool _applyingPreset;
+    private bool _loadingMarkerEditor;
+    private string? _projectPath;
+
+    public ProtectPage()
+    {
+        InitializeComponent();
+        VirtualFilesList.ItemsSource = _virtualFiles;
+        MarkerList.ItemsSource = _markerRules;
+        CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(null);
+        ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(null);
+        var initialPreset = PresetBox.SelectedIndex;
+        PresetBox.SelectedIndex = -1;
+        PresetBox.SelectedIndex = initialPreset;
+    }
+
+    protected override void OnNavigatedTo(NavigationEventArgs e)
+    {
+        base.OnNavigatedTo(e);
+        InputPathBox.Focus(FocusState.Programmatic);
+    }
+
+    private nint WindowHandle => App.MainWindow?.WindowHandle ?? 0;
+
+    private async void BrowseInput_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileOpenPicker();
+        InitializeWithWindow.Initialize(picker, WindowHandle);
+        picker.FileTypeFilter.Add(".exe");
+        var file = await picker.PickSingleFileAsync();
+        if (file is not null) SetInputPath(file.Path);
+    }
+
+    private async void BrowseOutput_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileSavePicker { SuggestedFileName = SuggestedOutputName() };
+        InitializeWithWindow.Initialize(picker, WindowHandle);
+        picker.FileTypeChoices.Add("Windows 可执行文件", [".exe"]);
+        var file = await picker.PickSaveFileAsync();
+        if (file is not null) OutputPathBox.Text = file.Path;
+    }
+
+    private void FileCard_DragOver(object sender, DragEventArgs e)
+    {
+        if (e.DataView.Contains(StandardDataFormats.StorageItems))
+        {
+            e.AcceptedOperation = DataPackageOperation.Copy;
+            e.DragUIOverride.Caption = "使用此文件作为保护目标";
+            e.DragUIOverride.IsCaptionVisible = true;
+        }
+    }
+
+    private async void FileCard_Drop(object sender, DragEventArgs e)
+    {
+        if (!e.DataView.Contains(StandardDataFormats.StorageItems)) return;
+        var items = await e.DataView.GetStorageItemsAsync();
+        var file = items.OfType<StorageFile>().FirstOrDefault(item =>
+            string.Equals(item.FileType, ".exe", StringComparison.OrdinalIgnoreCase));
+        if (file is not null) SetInputPath(file.Path);
+    }
+
+    private void InputPathBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        var path = InputPathBox.Text.Trim();
+        if (!File.Exists(path))
+        {
+            _peSummary = null;
+            _markerRules.Clear();
+            ArchitectureBadge.Text = "等待有效文件";
+            PeInfoBar.IsOpen = false;
+            UpdateMarkerEditor();
+            CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(null);
+            ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(null);
+            UpdateCapabilitySummary();
+            return;
+        }
+
+        _peSummary = PeInspector.Inspect(path);
+        ArchitectureBadge.Text = _peSummary.IsValid
+            ? $"{_peSummary.Architecture} · {_peSummary.ToolchainDisplay}"
+            : "无效 PE 文件";
+        PeInfoBar.Severity = _peSummary.IsValid ? InfoBarSeverity.Informational : InfoBarSeverity.Error;
+        PeInfoBar.Title = _peSummary.IsValid ? "已识别目标" : "无法识别目标";
+        PeInfoBar.Message = _peSummary.IsValid
+            ? $"{_peSummary.Architecture} · {_peSummary.Kind} · {_peSummary.ToolchainDisplay} · {FormatSize(_peSummary.Size)}。{_peSummary.Detail}"
+            : _peSummary.Detail;
+        PeInfoBar.IsOpen = true;
+        MergeMarkerRules(_peSummary.Markers);
+        CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(_peSummary);
+        ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(_peSummary);
+        UpdateCapabilitySummary();
+
+        if (!_settingDefaultOutput && string.IsNullOrWhiteSpace(OutputPathBox.Text))
+        {
+            _settingDefaultOutput = true;
+            OutputPathBox.Text = SuggestedOutputPath(path);
+            _settingDefaultOutput = false;
+        }
+    }
+
+    private void SetInputPath(string path)
+    {
+        InputPathBox.Text = path;
+        _settingDefaultOutput = true;
+        OutputPathBox.Text = SuggestedOutputPath(path);
+        _settingDefaultOutput = false;
+    }
+
+    private void ModePicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        switch (ModePicker.SelectedIndex)
+        {
+            case 0:
+                ModeDescription.Title = "变异模式";
+                ModeDescription.Message = "对支持的 x64 代码执行等价变换，通常兼容性更高、体积增长更小。";
+                ModeDescription.Severity = InfoBarSeverity.Informational;
+                break;
+            case 1:
+                ModeDescription.Title = "虚拟化模式";
+                ModeDescription.Message = "将已标记的 x64 代码区域转换为自定义 VM 字节码。";
+                ModeDescription.Severity = InfoBarSeverity.Informational;
+                break;
+            default:
+                ModeDescription.Title = "Ultra 模式";
+                ModeDescription.Message = "同时启用代码变异与虚拟化，适合需要最高保护等级的 x64 程序。";
+                ModeDescription.Severity = InfoBarSeverity.Success;
+                break;
+        }
+        UpdateCapabilitySummary();
+    }
+
+    private void PresetBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ModePicker is null || MutationSlider is null || VmSlider is null ||
+            AntiDebugBox is null || AntiVmBox is null || MemoryProtectionSwitch is null ||
+            ImportProtectionSwitch is null || ResourceProtectionSwitch is null ||
+            PackSectionsSwitch is null || StripDebugSwitch is null) return;
+        if (_applyingPreset || PresetBox.SelectedItem is not ComboBoxItem { Tag: string tag }) return;
+        _applyingPreset = true;
+        try
+        {
+            switch (tag)
+            {
+                case "basic":
+                    ModePicker.SelectedIndex = 0;
+                    MutationSlider.Value = 1;
+                    VmSlider.Value = 0;
+                    AntiDebugBox.SelectedIndex = 0;
+                    AntiVmBox.SelectedIndex = 0;
+                    MemoryProtectionSwitch.IsOn = false;
+                    ImportProtectionSwitch.IsOn = false;
+                    ResourceProtectionSwitch.IsOn = false;
+                    PackSectionsSwitch.IsOn = true;
+                    StripDebugSwitch.IsOn = false;
+                    break;
+                case "balanced":
+                    ModePicker.SelectedIndex = 1;
+                    MutationSlider.Value = 2;
+                    VmSlider.Value = 5;
+                    AntiDebugBox.SelectedIndex = 1;
+                    AntiVmBox.SelectedIndex = 0;
+                    MemoryProtectionSwitch.IsOn = true;
+                    ImportProtectionSwitch.IsOn = true;
+                    ResourceProtectionSwitch.IsOn = false;
+                    PackSectionsSwitch.IsOn = true;
+                    StripDebugSwitch.IsOn = true;
+                    break;
+                case "high":
+                    ModePicker.SelectedIndex = 2;
+                    MutationSlider.Value = 3;
+                    VmSlider.Value = 8;
+                    AntiDebugBox.SelectedIndex = 2;
+                    AntiVmBox.SelectedIndex = 1;
+                    MemoryProtectionSwitch.IsOn = true;
+                    ImportProtectionSwitch.IsOn = true;
+                    ResourceProtectionSwitch.IsOn = true;
+                    PackSectionsSwitch.IsOn = true;
+                    StripDebugSwitch.IsOn = true;
+                    break;
+                case "ultra":
+                    ModePicker.SelectedIndex = 2;
+                    MutationSlider.Value = 3;
+                    VmSlider.Value = 10;
+                    AntiDebugBox.SelectedIndex = 3;
+                    AntiVmBox.SelectedIndex = 2;
+                    MemoryProtectionSwitch.IsOn = true;
+                    ImportProtectionSwitch.IsOn = true;
+                    ResourceProtectionSwitch.IsOn = true;
+                    PackSectionsSwitch.IsOn = true;
+                    StripDebugSwitch.IsOn = true;
+                    break;
+            }
+        }
+        finally
+        {
+            _applyingPreset = false;
+            UpdateCapabilitySummary();
+        }
+    }
+
+    private void MutationSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (MutationValue is null) return;
+        var labels = new[] { "关闭", "轻量", "中等", "高强度" };
+        var value = Math.Clamp((int)Math.Round(e.NewValue), 0, 3);
+        MutationValue.Text = $"{value} · {labels[value]}";
+        UpdateCapabilitySummary();
+    }
+
+    private void VmSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (VmValue is not null) VmValue.Text = $"{(int)Math.Round(e.NewValue)} / 10";
+        UpdateCapabilitySummary();
+    }
+
+    private async void AddVirtualFiles_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileOpenPicker();
+        InitializeWithWindow.Initialize(picker, WindowHandle);
+        picker.FileTypeFilter.Add("*");
+        var files = await picker.PickMultipleFilesAsync();
+        foreach (var file in files)
+            if (!_virtualFiles.Contains(file.Path, StringComparer.OrdinalIgnoreCase)) _virtualFiles.Add(file.Path);
+        VirtualFilesEmptyText.Visibility = _virtualFiles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void RemoveVirtualFiles_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var selected in VirtualFilesList.SelectedItems.Cast<string>().ToArray())
+            _virtualFiles.Remove(selected);
+        VirtualFilesEmptyText.Visibility = _virtualFiles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private async void StartButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!await ValidateAsync()) return;
+
+        var options = CollectOptions();
+        var plan = ProtectionPlanner.Create(options, _peSummary);
+        var planPath = await ProjectStore.SaveBuildPlanAsync(plan, "prebuild");
+        if (plan.HasBlockingConflicts)
+        {
+            await ShowDialogAsync("构建配置存在冲突", plan.Summary, true);
+            return;
+        }
+        SetRunning(true);
+        AppendLog($"—— {DateTime.Now:yyyy-MM-dd HH:mm:ss} 开始保护 ——");
+        AppendLog($"输入: {options.InputPath}");
+        AppendLog($"输出: {options.OutputPath}");
+        AppendLog(plan.Summary);
+        AppendLog($"构建计划: {planPath}");
+        RunStatusText.Text = "正在准备保护管线…";
+        RunProgress.Value = 0;
+        ProgressText.Text = "0%";
+        _runCancellation = new CancellationTokenSource();
+
+        var result = await _protector.RunAsync(options, (percent, message) =>
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                AppendLog(message);
+                if (percent >= 0)
+                {
+                    RunProgress.Value = percent;
+                    ProgressText.Text = $"{percent}%";
+                    RunStatusText.Text = message;
+                }
+            });
+        }, _runCancellation.Token);
+
+        SetRunning(false);
+        plan.Result = result.Success ? "success" : (result.ExitCode == -2 ? "cancelled" : "failed");
+        plan.ExitCode = result.ExitCode;
+        plan.CompletedAt = DateTimeOffset.Now;
+        await ProjectStore.SaveBuildPlanAsync(plan, plan.Result ?? "completed");
+        if (result.Success)
+        {
+            RunProgress.Value = 100;
+            ProgressText.Text = "100%";
+            RunStatusText.Text = "保护完成";
+            AppendLog("完成：已生成受保护文件。");
+            ActivityStore.Add(new ActivityItem(DateTimeOffset.Now, "保护完成", Path.GetFileName(options.OutputPath), true));
+            await ShowDialogAsync("保护完成", $"输出文件已生成：\n{options.OutputPath}");
+        }
+        else
+        {
+            var cancelled = result.ExitCode == -2;
+            RunStatusText.Text = cancelled ? "已取消" : "保护失败";
+            AppendLog(result.Summary);
+            ActivityStore.Add(new ActivityItem(DateTimeOffset.Now, cancelled ? "保护已取消" : "保护失败", result.Summary, false));
+            if (!cancelled) await ShowDialogAsync("保护失败", result.Summary, true);
+        }
+    }
+
+    private void CancelButton_Click(object sender, RoutedEventArgs e) => _runCancellation?.Cancel();
+
+    private void ClearLog_Click(object sender, RoutedEventArgs e) => LogBox.Text = string.Empty;
+
+    private ProtectionOptions CollectOptions()
+    {
+        var options = new ProtectionOptions
+        {
+            InputPath = InputPathBox.Text.Trim(),
+            OutputPath = OutputPathBox.Text.Trim(),
+            Mode = ModePicker.SelectedIndex switch
+            {
+                0 => ProtectionMode.Mutation,
+                1 => ProtectionMode.Virtualization,
+                _ => ProtectionMode.Ultra
+            },
+            MutationStrength = (int)Math.Round(MutationSlider.Value),
+            VmComplexity = (int)Math.Round(VmSlider.Value),
+            AntiDebugLevel = SelectedTag(AntiDebugBox),
+            AntiVmLevel = SelectedTag(AntiVmBox),
+            MemoryProtection = MemoryProtectionSwitch.IsOn,
+            ImportProtection = ImportProtectionSwitch.IsOn,
+            ResourceProtection = ResourceProtectionSwitch.IsOn,
+            PackSections = PackSectionsSwitch.IsOn,
+            EncryptSections = EncryptSectionsSwitch.IsOn,
+            StripDebugInfo = StripDebugSwitch.IsOn,
+            StripRelocations = StripRelocationsSwitch.IsOn,
+            StripExports = StripExportsSwitch.IsOn,
+            Watermark = WatermarkBox.Text.Trim(),
+            LicenseKey = LicenseKeyBox.Password,
+            ActivationBinding = ActivationBindingBox.Text.Trim(),
+        };
+        options.VirtualFiles.AddRange(_virtualFiles);
+        options.ObjectRules.AddRange(_markerRules);
+        return options;
+    }
+
+    private async Task<bool> ValidateAsync()
+    {
+        var input = InputPathBox.Text.Trim();
+        var output = OutputPathBox.Text.Trim();
+        if (!File.Exists(input))
+        {
+            await ShowDialogAsync("请选择有效文件", "输入文件不存在或无法访问。", true);
+            return false;
+        }
+        if (_peSummary is not { IsValid: true })
+        {
+            await ShowDialogAsync("文件格式无效", "目标不是可识别的 Windows PE 文件。", true);
+            return false;
+        }
+        if (_peSummary.IsDll)
+        {
+            await ShowDialogAsync("请选择 EXE 程序", $"NovaProtect {ProductInfo.Version} 的正式输入范围是由 C/C++、C#/VB .NET、Rust 或 Golang 生成的 EXE。", true);
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(output))
+        {
+            await ShowDialogAsync("请选择输出位置", "输出文件路径不能为空。", true);
+            return false;
+        }
+        if (string.Equals(Path.GetFullPath(input), Path.GetFullPath(output), StringComparison.OrdinalIgnoreCase))
+        {
+            await ShowDialogAsync("输出路径无效", "为了避免覆盖原文件，输出路径必须与输入路径不同。", true);
+            return false;
+        }
+
+        var plan = ProtectionPlanner.Create(CollectOptions(), _peSummary);
+        if (plan.HasBlockingConflicts)
+        {
+            await ShowDialogAsync("构建配置存在冲突", plan.Summary, true);
+            return false;
+        }
+        if (_peSummary.Architecture.Contains("x64", StringComparison.OrdinalIgnoreCase) &&
+            (ModePicker.SelectedIndex != 0) && VmSlider.Value <= 0)
+        {
+            await ShowDialogAsync("VM 复杂度为 0", "当前模式请求虚拟化，但 VM 复杂度为 0。请提高复杂度，或切换到变异模式。", true);
+            return false;
+        }
+        return true;
+    }
+
+    private void SetRunning(bool running)
+    {
+        StartButton.IsEnabled = !running;
+        CancelButton.Visibility = running ? Visibility.Visible : Visibility.Collapsed;
+        InputPathBox.IsEnabled = !running;
+        OutputPathBox.IsEnabled = !running;
+    }
+
+    private void AppendLog(string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return;
+        LogBox.Text += (LogBox.Text.Length == 0 ? string.Empty : Environment.NewLine) + line;
+        LogBox.SelectionStart = LogBox.Text.Length;
+    }
+
+    private void UpdateCapabilitySummary()
+    {
+        if (ConfigSummaryText is null) return;
+        ConfigSummaryText.Text = ProtectionPlanner.Create(CollectOptions(), _peSummary).Summary;
+    }
+
+    private void MergeMarkerRules(IReadOnlyList<ProtectionObjectRule> detected)
+    {
+        var previous = _markerRules.ToDictionary(rule => (rule.StartRva, rule.EndRva));
+        _markerRules.Clear();
+        foreach (var marker in detected)
+        {
+            if (previous.TryGetValue((marker.StartRva, marker.EndRva), out var rule)) _markerRules.Add(rule);
+            else
+            {
+                marker.VmComplexity = (int)Math.Round(VmSlider.Value);
+                marker.MutationStrength = (int)Math.Round(MutationSlider.Value);
+                _markerRules.Add(marker);
+            }
+        }
+        MarkerInfoBar.Title = _markerRules.Count == 0 ? "未发现 SDK marker" : $"发现 {_markerRules.Count} 个 SDK marker 区域";
+        MarkerInfoBar.Message = _markerRules.Count == 0
+            ? "对象编辑器保持为空；不会用导出、符号或反编译结果伪装成可保护对象。"
+            : "对象列表直接来自 NovaProtect SDK marker 的字节模式和 RVA 边界。";
+        MarkerInfoBar.Severity = _markerRules.Count == 0 ? InfoBarSeverity.Warning : InfoBarSeverity.Success;
+        MarkerList.SelectedIndex = _markerRules.Count > 0 ? 0 : -1;
+        UpdateMarkerEditor();
+    }
+
+    private void RescanMarkers_Click(object sender, RoutedEventArgs e)
+    {
+        var path = InputPathBox.Text.Trim();
+        if (!File.Exists(path)) return;
+        _peSummary = PeInspector.Inspect(path);
+        MergeMarkerRules(_peSummary.Markers);
+        CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(_peSummary);
+        ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(_peSummary);
+        UpdateCapabilitySummary();
+    }
+
+    private void MarkerList_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateMarkerEditor();
+
+    private void UpdateMarkerEditor()
+    {
+        if (MarkerNameBox is null) return;
+        _loadingMarkerEditor = true;
+        try
+        {
+            var selected = MarkerList.SelectedItem as ProtectionObjectRule;
+            var enabled = selected is not null;
+            MarkerNameBox.IsEnabled = enabled;
+            MarkerModeBox.IsEnabled = enabled;
+            MarkerVmBox.IsEnabled = enabled;
+            MarkerMutationBox.IsEnabled = enabled;
+            MarkerActivationSwitch.IsEnabled = enabled;
+            MarkerNameBox.Text = selected?.Name ?? string.Empty;
+            MarkerModeBox.SelectedIndex = selected?.Mode switch
+            {
+                MarkerProtectionMode.Skip => 1,
+                MarkerProtectionMode.Virtualization => 2,
+                MarkerProtectionMode.Ultra => 3,
+                _ => 0
+            };
+            MarkerVmBox.Value = selected?.VmComplexity ?? 0;
+            MarkerMutationBox.Value = selected?.MutationStrength ?? 0;
+            MarkerActivationSwitch.IsOn = selected?.LockToActivation ?? false;
+            MarkerRangeText.Text = selected is null ? string.Empty :
+                $"来源 {selected.Provenance}；marker RVA 0x{selected.MarkerRva:X8}；区域 {selected.AddressRange}；{selected.Size} 字节";
+        }
+        finally { _loadingMarkerEditor = false; }
+    }
+
+    private void MarkerEditor_Changed(object sender, object e) => ApplyMarkerEditor();
+    private void MarkerEditor_NumberChanged(NumberBox sender, NumberBoxValueChangedEventArgs e) => ApplyMarkerEditor();
+    private void MarkerEditor_Toggled(object sender, RoutedEventArgs e) => ApplyMarkerEditor();
+
+    private void ApplyMarkerEditor()
+    {
+        if (_loadingMarkerEditor || MarkerList.SelectedItem is not ProtectionObjectRule selected) return;
+        selected.Name = string.IsNullOrWhiteSpace(MarkerNameBox.Text) ? selected.Id : MarkerNameBox.Text.Trim();
+        selected.Mode = MarkerModeBox.SelectedIndex switch
+        {
+            1 => MarkerProtectionMode.Skip,
+            2 => MarkerProtectionMode.Virtualization,
+            3 => MarkerProtectionMode.Ultra,
+            _ => MarkerProtectionMode.Inherit
+        };
+        selected.VmComplexity = double.IsNaN(MarkerVmBox.Value) ? 0 : Math.Clamp((int)MarkerVmBox.Value, 0, 10);
+        selected.MutationStrength = double.IsNaN(MarkerMutationBox.Value) ? 0 : Math.Clamp((int)MarkerMutationBox.Value, 0, 3);
+        selected.LockToActivation = MarkerActivationSwitch.IsOn;
+        var index = MarkerList.SelectedIndex;
+        MarkerList.ItemsSource = null;
+        MarkerList.ItemsSource = _markerRules;
+        MarkerList.SelectedIndex = index;
+        UpdateCapabilitySummary();
+    }
+
+    private async void SaveProject_Click(object sender, RoutedEventArgs e) => await SaveProjectAsync(false);
+    private async void ExportProject_Click(object sender, RoutedEventArgs e) => await SaveProjectAsync(true);
+
+    private async Task SaveProjectAsync(bool forcePicker)
+    {
+        var path = forcePicker ? null : _projectPath;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            var picker = new FileSavePicker { SuggestedFileName = Path.GetFileNameWithoutExtension(SuggestedOutputName()) };
+            InitializeWithWindow.Initialize(picker, WindowHandle);
+            picker.FileTypeChoices.Add("NovaProtect 项目", [".novaprotect.json"]);
+            var file = await picker.PickSaveFileAsync();
+            if (file is null) return;
+            path = file.Path;
+        }
+        await ProjectStore.SaveProjectAsync(path, CollectOptions());
+        _projectPath = path;
+        AppendLog($"项目已保存: {path}");
+    }
+
+    private async void LoadProject_Click(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileOpenPicker();
+        InitializeWithWindow.Initialize(picker, WindowHandle);
+        picker.FileTypeFilter.Add(".json");
+        var file = await picker.PickSingleFileAsync();
+        if (file is null) return;
+        try
+        {
+            var project = await ProjectStore.LoadProjectAsync(file.Path);
+            ApplyOptions(project.Options);
+            _projectPath = file.Path;
+            AppendLog($"项目已导入: {file.Path}");
+        }
+        catch (Exception ex) { await ShowDialogAsync("项目导入失败", ex.Message, true); }
+    }
+
+    private async void ExportBuildPlan_Click(object sender, RoutedEventArgs e)
+    {
+        var path = await ProjectStore.SaveBuildPlanAsync(ProtectionPlanner.Create(CollectOptions(), _peSummary), "manual");
+        AppendLog($"构建计划已导出: {path}");
+    }
+
+    private void ApplyOptions(ProtectionOptions options)
+    {
+        _applyingPreset = true;
+        try
+        {
+            SetInputPath(options.InputPath);
+            OutputPathBox.Text = options.OutputPath;
+            ModePicker.SelectedIndex = options.Mode switch { ProtectionMode.Mutation => 0, ProtectionMode.Virtualization => 1, _ => 2 };
+            MutationSlider.Value = options.MutationStrength;
+            VmSlider.Value = options.VmComplexity;
+            SelectTag(AntiDebugBox, options.AntiDebugLevel);
+            SelectTag(AntiVmBox, options.AntiVmLevel);
+            MemoryProtectionSwitch.IsOn = options.MemoryProtection;
+            ImportProtectionSwitch.IsOn = options.ImportProtection;
+            ResourceProtectionSwitch.IsOn = options.ResourceProtection;
+            PackSectionsSwitch.IsOn = options.PackSections;
+            EncryptSectionsSwitch.IsOn = options.EncryptSections;
+            StripDebugSwitch.IsOn = options.StripDebugInfo;
+            StripRelocationsSwitch.IsOn = options.StripRelocations;
+            StripExportsSwitch.IsOn = options.StripExports;
+            WatermarkBox.Text = options.Watermark;
+            LicenseKeyBox.Password = options.LicenseKey;
+            ActivationBindingBox.Text = options.ActivationBinding;
+            _virtualFiles.Clear();
+            foreach (var item in options.VirtualFiles) _virtualFiles.Add(item);
+            MergeMarkerRules(_peSummary?.Markers ?? []);
+            var saved = options.ObjectRules.ToDictionary(rule => (rule.StartRva, rule.EndRva));
+            for (var i = 0; i < _markerRules.Count; i++)
+                if (saved.TryGetValue((_markerRules[i].StartRva, _markerRules[i].EndRva), out var rule)) _markerRules[i] = rule;
+            VirtualFilesEmptyText.Visibility = _virtualFiles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        finally { _applyingPreset = false; UpdateMarkerEditor(); UpdateCapabilitySummary(); }
+    }
+
+    private async Task ShowDialogAsync(string title, string content, bool error = false)
+    {
+        var panel = new StackPanel { Spacing = 10 };
+        if (error)
+            panel.Children.Add(new InfoBar { IsOpen = true, IsClosable = false, Severity = InfoBarSeverity.Error, Message = content });
+        else
+            panel.Children.Add(new TextBlock { Text = content, TextWrapping = TextWrapping.Wrap });
+        await new ContentDialog
+        {
+            XamlRoot = XamlRoot,
+            Title = title,
+            Content = panel,
+            CloseButtonText = "确定",
+            DefaultButton = ContentDialogButton.Close
+        }.ShowAsync();
+    }
+
+    private static int SelectedTag(ComboBox box) =>
+        box.SelectedItem is ComboBoxItem { Tag: string tag } && int.TryParse(tag, out var value) ? value : 0;
+
+    private static void SelectTag(ComboBox box, int value)
+    {
+        foreach (var item in box.Items)
+        {
+            if (item is ComboBoxItem { Tag: string tag }
+                && int.TryParse(tag, out var candidate)
+                && candidate == value)
+            {
+                box.SelectedItem = item;
+                return;
+            }
+        }
+
+        box.SelectedIndex = 0;
+    }
+
+    private string SuggestedOutputName()
+    {
+        var input = InputPathBox.Text.Trim();
+        return string.IsNullOrWhiteSpace(input) ? "protected.exe" : Path.GetFileName(SuggestedOutputPath(input));
+    }
+
+    private static string SuggestedOutputPath(string input)
+    {
+        var directory = Path.GetDirectoryName(input) ?? string.Empty;
+        var name = Path.GetFileNameWithoutExtension(input);
+        var extension = Path.GetExtension(input);
+        return Path.Combine(directory, $"{name}_protected{extension}");
+    }
+
+    private static string FormatSize(long size) => size switch
+    {
+        >= 1024 * 1024 => $"{size / 1024d / 1024d:F1} MB",
+        >= 1024 => $"{size / 1024d:F1} KB",
+        _ => $"{size} B"
+    };
+}
+
