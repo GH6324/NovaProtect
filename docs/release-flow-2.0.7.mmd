@@ -1,0 +1,15 @@
+flowchart TD
+  A[统一 VERSION 2.0.7] --> B[编译自有四组件]
+  B --> C[真实 VMP Lua 选项和 SDK Ultra]
+  C --> D[盘点所有文件并尝试所有 PE]
+  D --> E[独立启动及组合业务/账户/拒绝测试]
+  E -->|第三方不兼容| F[保留原始第三方依赖和候选证据]
+  E -->|验证通过| G[签名哈希清单]
+  F --> G
+  G --> H[真实 UI 五语言保护和运行]
+  H --> I[静默安装 图标与快捷方式]
+  I --> J[官网账户下载 安装包 SHA256]
+  J --> K[Linux x64 网站 ZIP]
+  K --> L[用户上传宝塔 bash install.sh]
+  L --> M[自动 systemd Nginx health no-store]
+  M --> N[部署后 Linux/CDN 实际验收]

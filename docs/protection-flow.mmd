@@ -1,0 +1,25 @@
+flowchart LR
+    A[WinUI 项目配置] --> B[PeInspector]
+    B --> C{目标能力矩阵}
+    C -->|原生 x64| D[SDK marker 对象规则]
+    C -->|原生 x86| E[x86 loader 能力]
+    C -->|.NET x86/x64| F[CLR-safe 加密 EXE envelope]
+    C -->|ARM64 / DLL 裁剪冲突| R[Fail-fast 冲突]
+    D --> G[ProtectionPlanner]
+    E --> G
+    F --> G
+    G --> H[requested / effective / skipped / conflicts]
+    H --> I[*.novaprotect-build.json]
+    H -->|无阻断冲突| J[novaprotect.exe]
+    J --> K[区段打包/加密]
+    J --> L[导入虚拟化]
+    J --> M[重定位/导出裁剪]
+    J --> N[x64 marker VM/Ultra]
+    J --> O[x64 许可/激活校验]
+    K --> P[受保护 PE]
+    L --> P
+    M --> P
+    N --> P
+    O --> P
+    P --> Q[运行验证 + 结构断言]
+
