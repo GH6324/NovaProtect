@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>NovaProtect.PlannerSmoke</AssemblyName>
+    <RootNamespace>NovaProtect.PlannerSmoke</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\ui\Models\ProtectionOptions.cs" Link="Models\ProtectionOptions.cs" />
+    <Compile Include="..\..\ui\Services\PeInspector.cs" Link="Services\PeInspector.cs" />
+    <Compile Include="..\..\ui\Services\ProtectionPlanner.cs" Link="Services\ProtectionPlanner.cs" />
+    <Compile Include="..\..\ui\Services\ProjectStore.cs" Link="Services\ProjectStore.cs" />
+  </ItemGroup>
+</Project>
