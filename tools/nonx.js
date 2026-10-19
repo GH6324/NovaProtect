@@ -1,0 +1,1 @@
+const fs=require('fs'); const b=fs.readFileSync(process.argv[2]); const e=b.indexOf('PE\0\0'); let d=b.readUInt16LE(e+24+70); d&=~0x100; b.writeUInt16LE(d,e+24+70); fs.writeFileSync(process.argv[2],b); console.log(d.toString(16));

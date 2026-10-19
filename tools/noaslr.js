@@ -1,0 +1,1 @@
+const fs=require('fs'); const f=process.argv[2]; const b=fs.readFileSync(f); const e=b.indexOf('PE\0\0'); const opt=e+24; let d=b.readUInt16LE(opt+70); console.log('dllchar',d.toString(16)); d&=~0x40; b.writeUInt16LE(d,opt+70); fs.writeFileSync(f,b); console.log('patched',d.toString(16));
