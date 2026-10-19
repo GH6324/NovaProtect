@@ -1,0 +1,11 @@
+[Unit]
+Description=Run NovaProtect offline upgrade executor
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=novaprotect-upgrade-executor.service
+
+[Install]
+WantedBy=timers.target

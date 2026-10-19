@@ -1,0 +1,91 @@
+{
+  "format": "novaprotect-cdnfly-policy",
+  "formatVersion": 1,
+  "domain": "nova.fbi.plus",
+  "importNote": "Declarative mapping for CDNfly console rules. It is not an official CDNfly API payload; copy the match and action values into the console.",
+  "priorityOrder": ["application-dynamic", "application-static", "fallback"],
+  "rules": [
+    {
+      "id": "application-dynamic",
+      "priority": 1000,
+      "match": {
+        "pathExact": [
+          "/",
+          "/privacy",
+          "/install",
+          "/install.php",
+          "/admin/login",
+          "/admin",
+          "/client-updates",
+          "/download",
+          "/logout",
+          "/health"
+        ],
+        "pathPrefix": ["/api/"]
+      },
+      "methods": ["GET", "HEAD", "POST"],
+      "actions": {
+        "originPassThrough": true,
+        "edgeCache": "bypass",
+        "browserCache": "bypass",
+        "javascriptChallenge": "off",
+        "ccChallenge": "off",
+        "botChallenge": "off",
+        "preserveCookie": true,
+        "preserveSetCookie": true,
+        "preserveOrigin": true,
+        "preserveRange": true
+      }
+    },
+    {
+      "id": "application-static",
+      "priority": 900,
+      "match": {
+        "pathPrefix": ["/css/", "/js/", "/assets/"],
+        "pathExact": ["/favicon.ico"]
+      },
+      "methods": ["GET", "HEAD"],
+      "actions": {
+        "originPassThrough": true,
+        "edgeCache": "bypass",
+        "browserCache": "bypass",
+        "javascriptChallenge": "off",
+        "ccChallenge": "off",
+        "botChallenge": "off",
+        "preserveCookie": true,
+        "preserveSetCookie": true,
+        "preserveOrigin": true,
+        "preserveRange": true
+      }
+    },
+    {
+      "id": "fallback",
+      "priority": 100,
+      "match": { "pathPrefix": ["/"] },
+      "methods": ["GET", "HEAD", "POST"],
+      "actions": {
+        "originPassThrough": true,
+        "edgeCache": "respect-origin",
+        "browserCache": "respect-origin",
+        "javascriptChallenge": "keep-existing",
+        "ccChallenge": "keep-existing",
+        "botChallenge": "keep-existing",
+        "preserveCookie": true,
+        "preserveSetCookie": true,
+        "preserveOrigin": true,
+        "preserveRange": true
+      }
+    }
+  ],
+  "originContract": {
+    "forwardRequestHeaders": ["Host", "Origin", "Cookie", "Range", "X-Forwarded-For", "X-Forwarded-Proto"],
+    "preserveResponseHeaders": ["Set-Cookie", "Cache-Control", "CDN-Cache-Control", "Surrogate-Control", "Vary", "Content-Range"],
+    "originCache": "disabled-for-application-routes",
+    "publicScheme": "https"
+  },
+  "acceptance": {
+    "mustNotReturnStatus": [444],
+    "mustNotInjectBody": ["/_guard/auto.js"],
+    "commands": ["bash deploy/cdnfly-check.sh https://nova.fbi.plus"]
+  }
+}

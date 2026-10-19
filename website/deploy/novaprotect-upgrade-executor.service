@@ -1,0 +1,13 @@
+[Unit]
+Description=NovaProtect offline upgrade executor
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/www/server/novaprotect/bin/upgrade-executor.sh --once
+PrivateTmp=true
+ProtectHome=true
+UMask=0077
+
