@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <Version>2.2.7</Version>
+    <AssemblyVersion>2.2.7.0</AssemblyVersion>
+    <FileVersion>2.2.7.0</FileVersion>
+    <InformationalVersion>2.2.7</InformationalVersion>
+    <Product>NovaProtect</Product>
+    <Company>NovaProtect</Company>
+    <Authors>NovaProtect</Authors>
+  </PropertyGroup>
+</Project>
