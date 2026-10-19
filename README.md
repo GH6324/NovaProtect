@@ -78,14 +78,3 @@ NovaProtect 的产品设计主要参考 VMProtect Professional 与 Themida。VMP
 | ARM64            | 只读识别    | 暂不支持      | 暂不支持    |
 
 原生导入保护覆盖受支持的 x86/x64 目标；.NET 当前提供加密封装，尚未实现 IL 虚拟化；ARM64 暂不生成保护输出。实际可用项目以客户端构建计划和目标程序验证结果为准。
-
-
-**产品信息**
-
-产品名称  NovaProtect
-
-产品定位  Windows EXE 代码保护工作台
-
-面向用户  Windows 软件开发者与软件发布团队
-
-产品官网  nova.fbi.plus
