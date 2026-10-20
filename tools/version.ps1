@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [ValidateSet('Check', 'Sync', 'Seal', 'Bump')]
   [string]$Action = 'Check',
@@ -79,7 +79,7 @@ function Sync-Version([version]$version) {
   # 30 characters or the website release notes lose their tail.
   Write-Utf8 (Join-Path $root 'installer\version.iss') @"
 #define MyAppVersion "$text"
-#define MyAppVersionComments "移除账号与会员系统；资源加密保留图标；修复在线更新"
+#define MyAppVersionComments "新增 SDK 函数加密；强化反沙箱与反调试"
 "@
 
   $websiteVersionPath = Join-Path $root 'website\VERSION'
