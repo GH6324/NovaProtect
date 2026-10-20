@@ -4,7 +4,7 @@
 
 本软件承诺,不逆向正版的VMP和themida,只摸索思路
 
-NovaProtect 是 Windows EXE 保护工作台，官网为 https://nova.fbi.plus。
+NovaProtect 是 Windows EXE 保护工作台，官网为 https://nova.fbi.plus
 
 客户端能力
 - 支持 C/C++、C#/VB .NET、Rust、Golang EXE 的识别和规划；实际处理按 PE/CLR 格式，不按语言标签伪装能力。
