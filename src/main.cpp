@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <filesystem>
+#include <windows.h>
 
 using namespace np;
 
@@ -110,10 +111,55 @@ static bool parse_range(const std::string& value, int min, int max, uint8_t& out
     return true;
 }
 
+static bool parse_range_u32(const std::string& value, unsigned long min, unsigned long max, uint32_t& out) {
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(value.c_str(), &end, 10);
+    if (!end || *end != '\0' || parsed < min || parsed > max) return false;
+    out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
 static uint64_t fnv64_bytes(const void* bytes, size_t size, uint64_t hash = 0xCBF29CE484222325ull) {
     const auto* data = static_cast<const unsigned char*>(bytes);
     for (size_t i = 0; i < size; ++i) { hash ^= data[i]; hash *= 0x100000001B3ull; }
     return hash;
+}
+
+static uint64_t machine_guid_hash() {
+    // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid is derived from the
+    // machine's hardware identity (motherboard + install identity) and is the
+    // most stable single-machine factor available without kernel drivers. In
+    // online-analysis sandboxes it is frequently absent, zero, or one of a
+    // small set of known template GUIDs.
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ, &key) != ERROR_SUCCESS) return 0;
+    wchar_t guid[64] = {};
+    DWORD size = sizeof(guid);
+    DWORD type = 0;
+    LSTATUS rc = RegQueryValueExW(key, L"MachineGuid", nullptr, &type, reinterpret_cast<BYTE*>(guid), &size);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || type != REG_SZ) return 0;
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (wchar_t* p = guid; *p; ++p) {
+        unsigned char lo = (unsigned char)(*p & 0xFF);
+        unsigned char hi = (unsigned char)((*p >> 8) & 0xFF);
+        h = fnv64_bytes(&lo, 1, h);
+        h = fnv64_bytes(&hi, 1, h);
+    }
+    return h;
+}
+
+static uint64_t volume_serial() {
+    // The system drive volume serial number is a per-machine, per-installation
+    // identifier, so it separates two machines that share the same CPU model.
+    // On failure the fingerprint degrades to the CPUID component only.
+    wchar_t sysroot[MAX_PATH] = {};
+    UINT count = GetSystemDirectoryW(sysroot, MAX_PATH);
+    if (count == 0 || count >= MAX_PATH) return 0;
+    wchar_t root[4] = { sysroot[0], L':', L'\\', L'\0' };
+    DWORD serial = 0;
+    if (!GetVolumeInformationW(root, nullptr, 0, &serial, nullptr, nullptr, nullptr, 0)) return 0;
+    return (uint64_t)serial;
 }
 
 static uint64_t current_machine_id() {
@@ -134,9 +180,16 @@ static uint64_t current_machine_id() {
         h = fnv64_bytes(&c, sizeof(c), h);
         h = fnv64_bytes(&d, sizeof(d), h);
     }
+    // Mix the volume serial and machine GUID in via FNV-1a so the
+    // components are bound cryptographically rather than XORed. The
+    // GUID is the primary stability anchor; the volume serial is a
+    // per-installation discriminator.
+    uint64_t vs = volume_serial();
+    uint64_t mg = machine_guid_hash();
+    h = fnv64_bytes(&vs, sizeof(vs), h);
+    h = fnv64_bytes(&mg, sizeof(mg), h);
     return h;
 }
-
 static bool parse_region_spec(const std::string& spec, FunctionProtect& out, std::string& error) {
     std::vector<std::string> parts;
     size_t pos = 0;
@@ -198,6 +251,16 @@ static bool apply_option(PackerConfig& config, const std::string& key, const std
     else if (key == "watermark") { config.enable_watermark = !value.empty(); config.watermark = value; }
     else if (key == "license-key" || key == "license") { config.enable_licensing = !value.empty(); config.license_key = value; }
     else if (key == "activation") { config.enable_activation = !value.empty(); config.activation_key = value; }
+    else if (key == "sandbox-guard" || key == "sandbox") config.enable_sandbox_guard = parse_bool(value);
+    else if (key == "sandbox-threshold" || key == "sbox-thr") { if (!parse_range_u32(value, 0, 100, config.sandbox_score_threshold)) { error = "sandbox threshold must be 0..100"; return false; } }
+    else if (key == "anti-dump" || key == "antidump") config.enable_anti_dump = parse_bool(value);
+    else if (key == "env-check" || key == "envcheck") config.enable_env_check = parse_bool(value);
+    else if (key == "min-cpu" || key == "mincpu") { if (!parse_range_u32(value, 1, 256, config.min_cpu_count)) { error = "min-cpu must be 1..256"; return false; } }
+    else if (key == "min-ram-mb" || key == "minram") { if (!parse_range_u32(value, 0, 1048576, config.min_ram_mb)) { error = "min-ram-mb must be 0..1048576"; return false; } }
+    else if (key == "min-uptime-ms" || key == "minuptime") { if (!parse_range_u32(value, 0, 4294967295ul, config.min_uptime_ms)) { error = "min-uptime-ms must be 0..4294967295"; return false; } }
+    else if (key == "min-screen-w" || key == "minscreenw") { if (!parse_range_u32(value, 0, 32767, config.min_screen_width)) { error = "min-screen-w must be 0..32767"; return false; } }
+    else if (key == "min-screen-h" || key == "minscreenh") { if (!parse_range_u32(value, 0, 32767, config.min_screen_height)) { error = "min-screen-h must be 0..32767"; return false; } }
+    else if (key == "min-monitor" || key == "minmonitor") { if (!parse_range_u32(value, 0, 64, config.min_monitor_count)) { error = "min-monitor must be 0..64"; return false; } }
     else if (key == "virtual-file" || key == "vf") { config.enable_virtual_files = true; config.virtual_files.push_back(value); }
     else {
         error = "unsupported option in script: " + key;
@@ -293,6 +356,16 @@ int wmain(int argc, wchar_t* argv[]) {
             config.function_regions.push_back(region);
         }
         else if (arg == "-vf" && i + 1 < argc) { if (!apply_option(config, "vf", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
+        else if (arg == "-sandbox-guard" || arg == "-sandbox") { config.enable_sandbox_guard = true; }
+        else if (arg == "-anti-dump" || arg == "-antidump") { config.enable_anti_dump = true; }
+        else if (arg == "-env-check" || arg == "-envcheck") { config.enable_env_check = true; }
+        else if (arg == "-sandbox-threshold" && i + 1 < argc) { if (!apply_option(config, "sandbox-threshold", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
+        else if (arg == "-min-cpu" && i + 1 < argc) { if (!apply_option(config, "min-cpu", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
+        else if (arg == "-min-ram-mb" && i + 1 < argc) { if (!apply_option(config, "min-ram-mb", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
+        else if (arg == "-min-uptime-ms" && i + 1 < argc) { if (!apply_option(config, "min-uptime-ms", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
+        else if (arg == "-min-screen-w" && i + 1 < argc) { if (!apply_option(config, "min-screen-w", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
+        else if (arg == "-min-screen-h" && i + 1 < argc) { if (!apply_option(config, "min-screen-h", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
+        else if (arg == "-min-monitor" && i + 1 < argc) { if (!apply_option(config, "min-monitor", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
         else { printf("Error: unknown option: %s\n", arg.c_str()); return 2; }
     }
 

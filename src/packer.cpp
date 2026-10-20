@@ -1009,6 +1009,9 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
     const bool itg = config_.memory_protection;
     const bool mut = config_.enable_mutation && config_.mutation_strength > 0;
     const bool act = config_.enable_activation && !config_.activation_key.empty();
+    const bool sandbox = config_.enable_sandbox_guard;
+    const bool antidump = config_.enable_anti_dump;
+    const bool envchk = config_.enable_env_check;
 
     uint32_t flags = 0;
     if (ad)  flags |= 0x01;
@@ -1020,6 +1023,9 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
     if (itg) flags |= 0x40;
     if (mut) flags |= 0x80;
     if (act) flags |= 0x100;
+    if (sandbox) flags |= 0x200;
+    if (antidump) flags |= 0x400;
+    if (envchk) flags |= 0x800;
     if (!flags) return true;
 
     // ---- mutation kernel --------------------------------------------------
@@ -1047,16 +1053,25 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
         expected_mut_hash = h;
     }
 
-    // ---- NPP1 descriptor --------------------------------------------------
-    std::vector<uint8_t> data(96, 0);
+    // ---- NPP1 descriptor (v2) ---------------------------------------------
+    std::vector<uint8_t> data(128, 0);
     npPatch32(data, 0, 0x3150504E);        // 'NPP1'
-    npPatch32(data, 4, 1);                 // version
+    npPatch32(data, 4, 2);                 // version 2 (sandbox/dump/env fields)
     npPatch32(data, 8, flags);
     npPatch32(data, 12, config_.anti_debug_level);
     npPatch32(data, 16, config_.anti_vm_level);
     npPatch64(data, 24, tim ? 8000ull : 0ull);
     npPatch64(data, 32, expected_mut_hash);
     if (act) npPatch64(data, 80, std::strtoull(config_.activation_key.c_str(), nullptr, 16));
+    if (sandbox) npPatch32(data, 96, config_.sandbox_score_threshold ? config_.sandbox_score_threshold : 34u);
+    if (envchk) {
+        npPatch32(data, 100, config_.min_cpu_count);
+        npPatch32(data, 104, config_.min_ram_mb);
+        npPatch32(data, 108, config_.min_uptime_ms);
+        npPatch32(data, 112, config_.min_screen_width);
+        npPatch32(data, 116, config_.min_screen_height);
+        npPatch32(data, 120, config_.min_monitor_count);
+    }
 
     // ---- license program --------------------------------------------------
     std::vector<uint8_t> reverse(256, 0);
