@@ -43,6 +43,10 @@ button { cursor: pointer; }
 .nav-form button { min-height: 40px; padding: 7px 0; border: 0; background: transparent; }
 .nav-cta { padding: 8px 13px; border: 1px solid var(--border); border-radius: 6px; color: var(--text) !important; }
 .nav-cta:hover { border-color: var(--accent-strong); }
+.nav-github { display: inline-flex; align-items: center; gap: 5px; }
+.nav-github::after { content: '↗'; font-size: 11px; opacity: .7; }
+.site-footer a[href*='github'] { display: inline-flex; align-items: center; gap: 5px; }
+
 
 .site-main { padding: 56px 0 92px; }
 .site-footer { display: flex; justify-content: space-between; gap: 20px; padding: 24px 0 36px; border-top: 1px solid var(--border); color: var(--faint); font-size: 13px; }
