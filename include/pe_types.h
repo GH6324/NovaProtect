@@ -247,6 +247,16 @@ struct PackerConfig {
     bool import_protection    = false;
     bool resource_protection  = false;
     uint8_t anti_vm_level     = 0;
+    bool enable_sandbox_guard = false;   // NPP1 bit9: cumulative sandbox scoring
+    uint32_t sandbox_score_threshold = 34; // default tuned for 微步-style hosts
+    bool enable_anti_dump     = false;   // NPP1 bit10: live-memory dump self-check
+    bool enable_env_check     = false;   // NPP1 bit11: interactive desktop minimums
+    uint32_t min_cpu_count    = 2;
+    uint32_t min_ram_mb       = 4096;
+    uint32_t min_uptime_ms    = 3000;
+    uint32_t min_screen_width = 1024;
+    uint32_t min_screen_height = 768;
+    uint32_t min_monitor_count = 1;
 
     // Additional features
     bool enable_watermark     = false;
