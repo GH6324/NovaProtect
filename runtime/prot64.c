@@ -65,6 +65,9 @@ typedef signed   long long i64;
 #define NP_CHK_INTEGRITY  10
 #define NP_CHK_BADMOD    11
 #define NP_CHK_ACTIVATION 12
+#define NP_CHK_SANDBOX   13
+#define NP_CHK_DUMP      14
+#define NP_CHK_ENV       15
 
 /* ---- PEB / loader structures (offsets only, no headers needed) ---------- */
 #define PEB_BEING_DEBUGGED 0x02
@@ -90,6 +93,15 @@ static const char np_s_kernel32[] = "kernel32.dll";
 static const char np_s_qip[]      = "NtQueryInformationProcess";
 static const char np_s_getctx[]   = "GetThreadContext";
 static const char np_s_vprotect[] = "VirtualProtect";
+static const char np_s_qsi[]      = "NtQuerySystemInformation";
+static const char np_s_user32[]   = "user32.dll";
+static const char np_s_gsm[]      = "GetSystemMetrics";
+static const char np_s_gtt[]      = "GetTickCount64";
+
+/* ---- NT information classes ------------------------------------------- */
+#define NP_SIC_SYSTEM_BASIC_INFO     0u
+#define NP_SIC_SYSTEM_PROCESSOR_INFO 8u
+#define NP_SIC_SYSTEM_PROCESS_INFO   5u
 
 /* ========================================================================
  * minimal helpers
@@ -115,6 +127,65 @@ static void np_cpuid(u32 leaf, u32 subleaf, u32 out[4]) {
     out[0] = a; out[1] = b; out[2] = c; out[3] = d;
 }
 
+static void* np_module_by_name(const char* name);
+static void* np_export_by_name(void* mod, const char* name);
+
+static u64 np_volume_serial(void) {
+    // Resolve GetVolumeInformationW and GetSystemDirectoryW through kernel32.
+    // The volume serial is a per-machine, per-installation identifier, so it
+    // separates machines that share the same CPU model.
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (!k32) return 0;
+    typedef u32 (__attribute__((ms_abi)) *np_gsd_fn)(void*, u32);
+    np_gsd_fn gsd = (np_gsd_fn)np_export_by_name(k32, "GetSystemDirectoryW");
+    if (!gsd) return 0;
+    u16 dir[260];
+    u32 n = gsd(dir, 260);
+    if (!n || n >= 260) return 0;
+    u16 root[4];
+    root[0] = dir[0]; root[1] = (u16)L':'; root[2] = (u16)L'\\'; root[3] = 0;
+    typedef u32 (__attribute__((ms_abi)) *np_gvi_fn)(const u16*, void*, u32, u32*, void*, void*, void*, u32);
+    np_gvi_fn gvi = (np_gvi_fn)np_export_by_name(k32, "GetVolumeInformationW");
+    if (!gvi) return 0;
+    u32 serial = 0;
+    if (!gvi(root, 0, 0, &serial, 0, 0, 0, 0)) return 0;
+    return (u64)serial;
+}
+
+static u64 np_machine_guid_hash(void) {
+    // Read HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid through advapi32.
+    // It is derived from the machine's hardware identity and survives OS
+    // reinstalls / disk swaps on the same motherboard, making it the primary
+    // stability anchor for one-machine-one-license.
+    void* adv = np_module_by_name("advapi32.dll");
+    if (!adv) return 0;
+    typedef u32 (__attribute__((ms_abi)) *np_rok_fn)(void*, const u16*, u32, u32, void**);
+    np_rok_fn rok = (np_rok_fn)np_export_by_name(adv, "RegOpenKeyExW");
+    if (!rok) return 0;
+    typedef u32 (__attribute__((ms_abi)) *np_rqv_fn)(void*, const u16*, void*, u32*, u8*, u32*);
+    np_rqv_fn rqv = (np_rqv_fn)np_export_by_name(adv, "RegQueryValueExW");
+    if (!rqv) return 0;
+    typedef u32 (__attribute__((ms_abi)) *np_rck_fn)(void*);
+    np_rck_fn rck = (np_rck_fn)np_export_by_name(adv, "RegCloseKey");
+    static const u16 keyPath[] = { 'S','O','F','T','W','A','R','E','\\','M','i','c','r','o','s','o','f','t','\\','C','r','y','p','t','o','g','r','a','p','h','y',0 };
+    static const u16 valName[] = { 'M','a','c','h','i','n','e','G','u','i','d',0 };
+    void* key = 0;
+    if (rok((void*)0x80000002u, keyPath, 0, 0x20019u, &key) != 0 || !key) return 0;
+    u16 guid[64];
+    u32 size = (u32)sizeof(guid);
+    u32 type = 0;
+    u32 rc = rqv(key, valName, 0, &type, (u8*)guid, &size);
+    if (rck) rck(key);
+    if (rc != 0 || type != 1u) return 0;
+    u64 h = NP_FNV_BASIS;
+    for (u32 i = 0; i < size / 2 && guid[i]; i++) {
+        u8 lo = (u8)(guid[i] & 0xFF);
+        u8 hi = (u8)((guid[i] >> 8) & 0xFF);
+        h = np_fnv1a64(&lo, 1, h);
+        h = np_fnv1a64(&hi, 1, h);
+    }
+    return h;
+}
 static u64 np_machine_id(void) {
     u32 r[4];
     np_cpuid(0, 0, r);
@@ -135,11 +206,32 @@ static u64 np_machine_id(void) {
         h = np_fnv1a64((const u8*)&r[2], 4, h);
         h = np_fnv1a64((const u8*)&r[3], 4, h);
     }
+    u64 vs = np_volume_serial();
+    u64 mg = np_machine_guid_hash();
+    h = np_fnv1a64((const u8*)&vs, sizeof(vs), h);
+    h = np_fnv1a64((const u8*)&mg, sizeof(mg), h);
     return h;
 }
 
 static u32 np_rd32(const void* p) { return *(const volatile u32*)p; }
 static u64 np_rd64(const void* p) { return *(const volatile u64*)p; }
+
+static u64 np_rdtscp(void) {
+    u32 lo, hi, aux;
+    __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+    (void)aux;
+    return ((u64)hi << 32) | lo;
+}
+
+static void np_cpuid_leaf(u32 leaf, u32 subleaf, u32 out[4]) {
+    __asm__ volatile("cpuid" : "=a"(out[0]), "=b"(out[1]), "=c"(out[2]), "=d"(out[3]) : "a"(leaf), "c"(subleaf));
+}
+
+static u64 np_cpu_core_mask(void) {
+    u32 r[4];
+    np_cpuid_leaf(0x1, 0, r);
+    return ((u64)r[3] << 32) | (u64)r[1];   /* EDX:EBX APIC id, logical cores */
+}
 
 static u8* np_peb(void) {
     u8* peb;
@@ -673,7 +765,11 @@ static u32 np_chk_integrity(void* base, const u8* b) {
 
 static const char np_s_badmods[] =
     "SandboxieDll\0" "SBIEDLL\0" "api_log\0"
-    "vmcheck\0" "wpesype\0" "dirwatch\0";
+    "vmcheck\0" "wpesype\0" "dirwatch\0"
+    "dbghelp\0" "dbgcore\0" "dbgeng\0" "dbgmodel\0"
+    "procmon\0" "processhacker\0" "frida\0"
+    "wxwork\0" "wpscloudsvr\0" "salamand\0"
+    "lilith\0" "sandbox\0" "xworm\0" "antivm\0";
 
 static u32 np_chk_bad_modules(void) {
     u8* peb = np_peb();
@@ -705,6 +801,241 @@ static u32 np_chk_bad_modules(void) {
             }
         }
         cur = *(u8**)cur;
+    }
+    return 0;
+}
+
+/* ========================================================================
+ * sandbox / analysis-tool scoring (v2 flag bit 9)
+ *
+ * Each cheap observable contributes a weighted bit. A cumulative score at or
+ * above the pack-time threshold trips NP_CHK_SANDBOX. The weights are tuned
+ * so a physical desktop stays far below the default threshold while微步 and
+ * other online-analysis VMs / instrumented hosts cross it.
+ * ======================================================================== */
+
+static u32 np_sandbox_score(void) {
+    u32 score = 0;
+
+    /* 1. hypervisor vendor bits via CPUID 0x40000000 (Hyper-V exempt) */
+    u32 c[4] = {0};
+    np_cpuid_leaf(0x40000000u, 0, c);
+    if (c[0]) {
+        if (c[1] == 0x61774D56u && c[2] == 0x4D567265u && c[3] == 0x65726177u) score += 8;   /* VMware */
+        else if (c[1] == 0x4B4D564Bu && c[2] == 0x564B4D56u && c[3] == 0x0000004Du) score += 8; /* KVM */
+        else if (c[1] == 0x566E6558u && c[2] == 0x65584D4Du && c[3] == 0x4D4D566Eu) score += 8; /* Xen */
+        else if (c[1] == 0x786F4256u) score += 8;   /* VirtualBox */
+        else if (c[1] == 0x206C7270u) score += 8;   /* Parallels */
+    }
+
+    /* 2. physical CPU count through NtQuerySystemInformation */
+    void* ntdll = np_module_by_name(np_s_ntdll);
+    if (ntdll) {
+        typedef i32 (__attribute__((ms_abi)) *np_qsi_fn)(u32 cls, void* buf, u32 len, u32* ret);
+        np_qsi_fn qsi = (np_qsi_fn)np_export_by_name(ntdll, np_s_qsi);
+        if (qsi) {
+            u8 basic[64]; np_memset(basic, 0, sizeof(basic));
+            u32 ret = 0;
+            if (qsi(NP_SIC_SYSTEM_BASIC_INFO, basic, sizeof(basic), &ret) >= 0) {
+                u8 count = basic[0];
+                if (count < 2) score += 14;
+                else if (count < 4) score += 4;
+            }
+        }
+    }
+
+    /* 3. extremely small RAM is characteristic of online-analysis sandboxes */
+    if (ntdll) {
+        typedef i32 (__attribute__((ms_abi)) *np_qsi_fn)(u32 cls, void* buf, u32 len, u32* ret);
+        np_qsi_fn qsi = (np_qsi_fn)np_export_by_name(ntdll, np_s_qsi);
+        if (qsi) {
+            u8 basic[64]; np_memset(basic, 0, sizeof(basic));
+            u32 ret = 0;
+            if (qsi(NP_SIC_SYSTEM_BASIC_INFO, basic, sizeof(basic), &ret) >= 0) {
+                u64 pages = *(u64*)(basic + 24);   /* NumberOfPhysicalPages */
+                u64 pageSize = *(u32*)(basic + 32);
+                if (pages && pageSize && pages * pageSize < (4ull << 30)) score += 10;
+            }
+        }
+    }
+
+    /* 4. known sandbox / monitoring modules already hard-fail in
+     * np_chk_bad_modules; here score the softer instrumented-host markers. */
+    u8* peb = np_peb();
+    if (peb) {
+        u8* ldr = *(u8**)(peb + PEB_LDR);
+        if (ldr) {
+            u8* head = ldr + LDR_IN_LOAD_ORDER;
+            u8* cur  = *(u8**)head;
+            while (cur != head) {
+                u16 len = *(u16*)(cur + LDR_ENTRY_BASENAME);
+                u16* nm = *(u16**)(cur + LDR_ENTRY_BASENAME + 8);
+                if (nm && len) {
+                    len >>= 1;
+                    if (len == 12 && (nm[0]=='d'||nm[0]=='D') && (nm[1]=='b'||nm[1]=='B') &&
+                        (nm[2]=='g'||nm[2]=='G') && (nm[3]=='h'||nm[3]=='H')) score += 6;   /* dbghelp/dbgcore */
+                    if (len >= 7 && (nm[0]=='s'||nm[0]=='S') && (nm[1]=='b'||nm[1]=='B') &&
+                        (nm[2]=='i'||nm[2]=='I') && (nm[3]=='e'||nm[3]=='E')) score += 6;  /* sbie* */
+                }
+                cur = *(u8**)cur;
+            }
+        }
+    }
+
+    /* 5. RDTSCP + RDTSC timing spread across core migration */
+    u64 t1 = np_rdtscp();
+    u64 t2 = np_rdtsc();
+    u64 spread = t2 > t1 ? t2 - t1 : t1 - t2;
+    if (spread > 0x40000000ull) score += 6;
+
+    /* 6. per-CPU core mask consistency: online sandboxes often report a
+     * synthetic 1-vCPU topology with an implausible APIC core mask. */
+    u64 mask = np_cpu_core_mask();
+    if ((mask & 0xFFFF) == 0 || ((mask >> 16) & 0xFF) == 0) score += 3;
+
+    /* 7. known online-analysis sandbox DLLs (微步 and peers) walk the loader
+     * list. These hard-fail in np_chk_bad_modules only at the highest level;
+     * here they add weight to the cumulative score. */
+    if (np_chk_bad_modules()) score += 20;
+
+    /* 8. sleep compression: sandboxes accelerate Sleep/SleepEx and wall-clock
+     * time. Measure GetTickCount64 across a short busy-wait; a compressed
+     * wall clock (delta far below real elapsed cycles) is a strong VM signal. */
+    {
+        void* k32 = np_module_by_name(np_s_kernel32);
+        if (k32) {
+            typedef u64 (__attribute__((ms_abi)) *np_gtt_fn)(void);
+            np_gtt_fn gtt = (np_gtt_fn)np_export_by_name(k32, np_s_gtt);
+            if (gtt) {
+                u64 wall0 = gtt();
+                u64 cyc0 = np_rdtsc();
+                for (u32 i = 0; i < 64; i++) np_rdtscp();
+                u64 cyc1 = np_rdtsc();
+                u64 wall1 = gtt();
+                u64 cycles = cyc1 > cyc0 ? cyc1 - cyc0 : cyc0 - cyc1;
+                u64 wallms = wall1 >= wall0 ? wall1 - wall0 : wall0 - wall1;
+                // A real 2+ GHz core advances ~300k cycles per 1 ms of wall
+                // time. Sandboxes that virtualize RDTSC but run wall time fast
+                // produce an implausible ratio.
+                if (wallms == 0 || cycles / (wallms + 1) > 5000000ull) score += 8;
+            }
+        }
+    }
+
+    /* 9. interactive desktop / user environment heuristics for 微步. */
+    {
+        void* u32mod = np_module_by_name(np_s_user32);
+        if (u32mod) {
+            typedef int (__attribute__((ms_abi)) *np_gsm_fn)(int);
+            np_gsm_fn gsm = (np_gsm_fn)np_export_by_name(u32mod, np_s_gsm);
+            if (gsm) {
+                if (gsm(0) < 800 || gsm(1) < 600) score += 8;   /* SM_CXSCREEN/SM_CYSCREEN */
+            }
+        }
+        // Environment template names common in ephemeral analysis VMs.
+        void* k32 = np_module_by_name(np_s_kernel32);
+        if (k32) {
+            typedef u32 (__attribute__((ms_abi)) *np_gevw_fn)(const char*, char*, u32);
+            np_gevw_fn ge = (np_gevw_fn)np_export_by_name(k32, "GetEnvironmentVariableA");
+            if (ge) {
+                char name[64]; np_memset(name, 0, sizeof(name));
+                char host[64]; np_memset(host, 0, sizeof(host));
+                ge("COMPUTERNAME", host, sizeof(host));
+                ge("USERNAME", name, sizeof(name));
+                const char* tmpl = host[0] ? host : name;
+                if ((tmpl[0] == 'W' && tmpl[1] == 'i' && tmpl[2] == 'n') ||
+                    (tmpl[0] == 'A' && tmpl[1] == 'd' && tmpl[2] == 'm' && tmpl[3] == 'i' && tmpl[4] == 'n') ||
+                    (tmpl[0] == 'U' && tmpl[1] == 's' && tmpl[2] == 'e' && tmpl[3] == 'r')) score += 10;
+            }
+        }
+    }
+
+    return score;
+}
+
+/* ========================================================================
+ * anti memory-dump (v2 flag bit 10)
+ *
+ * A live dump is only useful while the image is fully restored. We verify that
+ * the image header still has its original loader-consumed DOS/NT signature and
+ * that the section table has not been flattened to zero (common Minidump /
+ * Procdump post-processing). The strongest signal is the PEB image base still
+ * matching the expected base.
+ * ======================================================================== */
+
+static u32 np_chk_dump(void* base) {
+    u8* img = (u8*)base;
+    if (!img) return 0;
+    if (img[0] != 'M' || img[1] != 'Z') return 1;
+    i32 lfanew = *(i32*)(img + 0x3C);
+    if (lfanew <= 0) return 1;
+    u8* nth = img + lfanew;
+    if (nth[0] != 'P' || nth[1] != 'E' || nth[2] != 0 || nth[3] != 0) return 1;
+    u16 nsec = *(u16*)(nth + 6);
+    if (nsec < 1 || nsec > 96) return 1;
+    u8* peb = np_peb();
+    if (!peb) return 0;
+    u8* loaded = *(u8**)(peb + 0x10);
+    if (loaded && loaded != img) return 1;
+    return 0;
+}
+
+/* ========================================================================
+ * environment self-check (v2 flag bit 11)
+ *
+ * Validates a real interactive desktop against pack-time thresholds. The
+ * fields are absolute minimums so commodity hardware always passes, while
+ * headless在线分析沙箱 workers fail. Every probe degrades to "pass" when the
+ * backing API is unavailable.
+ * ======================================================================== */
+
+static u32 np_chk_env(const u8* b) {
+    u32 min_cpu    = np_rd32(b + 100);
+    u32 min_ram_mb = np_rd32(b + 104);
+    u32 min_uptime = np_rd32(b + 108);
+    u32 min_w      = np_rd32(b + 112);
+    u32 min_h      = np_rd32(b + 116);
+    u32 min_mon    = np_rd32(b + 120);
+
+    /* CPU count from the same NT basic-info block */
+    void* ntdll = np_module_by_name(np_s_ntdll);
+    void* k32   = np_module_by_name(np_s_kernel32);
+    if (min_cpu && ntdll) {
+        typedef i32 (__attribute__((ms_abi)) *np_qsi_fn)(u32 cls, void* buf, u32 len, u32* ret);
+        np_qsi_fn qsi = (np_qsi_fn)np_export_by_name(ntdll, np_s_qsi);
+        if (qsi) {
+            u8 basic[64]; np_memset(basic, 0, sizeof(basic));
+            u32 ret = 0;
+            if (qsi(NP_SIC_SYSTEM_BASIC_INFO, basic, sizeof(basic), &ret) >= 0) {
+                if ((u8)basic[0] < min_cpu) return 1;
+                u64 pages = *(u64*)(basic + 24);
+                u64 pageSize = *(u32*)(basic + 32);
+                if (min_ram_mb && pages && pageSize &&
+                    pages * pageSize < (u64)min_ram_mb * 1048576ull) return 1;
+            }
+        }
+    }
+
+    if (min_uptime && k32) {
+        typedef u64 (__attribute__((ms_abi)) *np_uptime_fn)(void);
+        np_uptime_fn gtt = (np_uptime_fn)np_export_by_name(k32, np_s_gtt);
+        if (gtt && gtt() < (u64)min_uptime) return 1;
+    }
+
+    if (min_w || min_h || min_mon) {
+        void* u32mod = np_module_by_name(np_s_user32);
+        if (u32mod) {
+            typedef int (__attribute__((ms_abi)) *np_gsm_fn)(int);
+            np_gsm_fn gsm = (np_gsm_fn)np_export_by_name(u32mod, np_s_gsm);
+            if (gsm) {
+                int w = gsm(0);   /* SM_CXSCREEN */
+                int h = gsm(1);   /* SM_CYSCREEN */
+                int m = gsm(80);  /* SM_CMONITORS */
+                if (min_w && w < (int)min_w) return 1;
+                if (min_h && h < (int)min_h) return 1;
+                if (min_mon && m < (int)min_mon) return 1;
+            }
+        }
     }
     return 0;
 }
@@ -919,7 +1250,8 @@ u32 np_prot_start(void* base, void* hdr, void* blob, void* kern) {
 
     const u8* b = (const u8*)blob;
     if (np_rd32(b) != NPP_MAGIC) return 0;
-    if (np_rd32(b + 4) != 1) return 0;
+    u32 ver = np_rd32(b + 4);
+    if (ver < 1 || ver > 2) return 0;
 
     u32 flags = np_rd32(b + 8);
     if (!flags) return 0;
@@ -959,6 +1291,16 @@ u32 np_prot_start(void* base, void* hdr, void* blob, void* kern) {
     if (flags & 0x100u) {
         u64 expected = np_rd64(b + 80);
         if (!expected || np_machine_id() != expected) return NP_CHK_ACTIVATION;
+    }
+    if (flags & 0x200u) {
+        u32 threshold = np_rd32(b + 96);
+        if (threshold && np_sandbox_score() >= threshold) return NP_CHK_SANDBOX;
+    }
+    if (flags & 0x400u) {
+        if (np_chk_dump(base)) return NP_CHK_DUMP;
+    }
+    if (flags & 0x800u) {
+        if (np_chk_env(b)) return NP_CHK_ENV;
     }
     if (flags & 0x40u) {
         if (np_chk_integrity(base, b)) return NP_CHK_INTEGRITY;
