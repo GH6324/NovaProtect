@@ -21,13 +21,23 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 # workspace the build links the real import library; on an open-source clone
 # without the SDK the marker calls compile to no-ops (NOVAPROTECT_VMP_STUB)
 # and no VMProtectSDK64.dll is required at runtime.
-$vmpSdkLibrary = Join-Path (Split-Path -Parent $root) 'VMProtect Professional\Lib\Windows\MinGW\VMProtectSDK64.a'
-$vmpSdkRuntime = Join-Path (Split-Path -Parent $root) 'VMProtect Professional\Lib\Windows\VMProtectSDK64.dll'
+# Resolve the commercial VMProtect SDK. Priority:
+#   1. project-vendored third_party\vmprotect (checked in with the release)
+#   2. sibling "VMProtect Professional" install
+#   3. common absolute install paths
+# On success the real import library is linked and VMProtectSDK64.dll is
+# copied next to the protected binaries. Otherwise the same call sites compile
+# to no-ops via NOVAPROTECT_VMP_STUB (open-source clones).
+$vmpResolve = & (Join-Path $root 'tools\resolve-vmprotect-sdk.ps1') 2>$null | Out-String
+$vmpSdkLibrary = ''
+$vmpSdkRuntime = ''
+if ($vmpResolve -match 'NOVAPROTECT_VMP_LIB=(.+)') { $vmpSdkLibrary = $Matches[1].Trim() }
+if ($vmpResolve -match 'NOVAPROTECT_VMP_DLL=(.+)') { $vmpSdkRuntime = $Matches[1].Trim() }
 $vmpDefine = ''
 $vmpLink = @()
-if (Test-Path -LiteralPath $vmpSdkLibrary) {
+if ($vmpSdkLibrary -ne '' -and (Test-Path -LiteralPath $vmpSdkLibrary)) {
   $vmpLink = @($vmpSdkLibrary)
-  Write-Host '[vmp] linking VMProtect SDK import library'
+  Write-Host "[vmp] linking VMProtect SDK import library: $vmpSdkLibrary"
 } else {
   $vmpDefine = '-DNOVAPROTECT_VMP_STUB'
   Write-Host '[vmp] VMProtect SDK not found; building with no-op SDK markers (NOVAPROTECT_VMP_STUB)'
@@ -161,7 +171,8 @@ function Build-Cli {
   Write-Host '[core] compiling NovaProtect.Engine.exe...'
   & windres.exe runtime\novaprotect_cli.rc -O coff -o runtime\novaprotect_cli.res
   if ($LASTEXITCODE -ne 0) { throw 'cli resource build failed' }
-  & g++.exe -std=c++17 -O2 -municode $vmpDefine -o NovaProtect.Engine.exe src\main.cpp src\client_gate.cpp src\managed_envelope.cpp src\pe_lib.cpp src\packer.cpp src\packer_meta.cpp src\mutation.cpp src\disasm.cpp src\anti_debug.cpp src\vm_engine.cpp src\vm_obfuscate.cpp src\crypto_layers.cpp runtime\novaprotect_cli.res $vmpLink -Iinclude -Isrc -static -static-libgcc -static-libstdc++ -lbcrypt
+  $vmpArgs = @(); if ($vmpDefine -ne "") { $vmpArgs += $vmpDefine }
+  & g++.exe -std=c++17 -O2 -municode @vmpArgs -o NovaProtect.Engine.exe src\main.cpp src\client_gate.cpp src\managed_envelope.cpp src\pe_lib.cpp src\packer.cpp src\packer_meta.cpp src\mutation.cpp src\disasm.cpp src\anti_debug.cpp src\vm_engine.cpp src\vm_obfuscate.cpp src\crypto_layers.cpp runtime\novaprotect_cli.res @vmpLink -Iinclude -Isrc -static -static-libgcc -static-libstdc++ -lbcrypt
   if ($LASTEXITCODE -ne 0) { throw 'cli build failed' }
   Write-Host '[cli] ok'
   Pop-Location
@@ -172,7 +183,8 @@ function Build-ManagedHost {
   Write-Host '[managed-host] compiling NovaProtect.ManagedHost.exe...'
   & windres.exe runtime\managed_host.rc -O coff -o runtime\managed_host.res
   if ($LASTEXITCODE -ne 0) { throw 'managed host resource build failed' }
-  & g++.exe -std=c++17 -O2 -municode $vmpDefine -o NovaProtect.ManagedHost.exe runtime\managed_host.cpp runtime\managed_host.res $vmpLink -static -static-libgcc -static-libstdc++
+  $vmpArgs = @(); if ($vmpDefine -ne "") { $vmpArgs += $vmpDefine }
+  & g++.exe -std=c++17 -O2 -municode @vmpArgs -o NovaProtect.ManagedHost.exe runtime\managed_host.cpp runtime\managed_host.res @vmpLink -static -static-libgcc -static-libstdc++
   if ($LASTEXITCODE -ne 0) { throw 'managed host build failed' }
   Write-Host '[managed-host] ok'
   Pop-Location
