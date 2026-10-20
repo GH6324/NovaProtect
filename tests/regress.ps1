@@ -85,7 +85,7 @@ function Read-NppFacts {
   $bytes = [IO.File]::ReadAllBytes($Path)
   for ($i = 0; $i + 96 -le $bytes.Length; $i++) {
     if ($bytes[$i] -ne 0x4E -or $bytes[$i+1] -ne 0x50 -or $bytes[$i+2] -ne 0x50 -or $bytes[$i+3] -ne 0x31) { continue }
-    if ([BitConverter]::ToUInt32($bytes, $i + 4) -ne 1) { continue }
+    if ([BitConverter]::ToUInt32($bytes, $i + 4) -notin @(1,2)) { continue }
     return [pscustomobject]@{
       Flags = [BitConverter]::ToUInt32($bytes, $i + 8)
       ExpectedMachine = [BitConverter]::ToUInt64($bytes, $i + 80)
@@ -424,9 +424,11 @@ $null = & $Packer "$root\tests\test_target.exe" '-o' $licBad '-mode' 'ultra' '-m
 if (Test-Path $licBad) {
   $bytes = [IO.File]::ReadAllBytes($licBad)
   for ($i = 0; $i -lt $bytes.Length - 4; $i++) {
-    if ($bytes[$i] -eq 0x4E -and $bytes[$i+1] -eq 0x50 -and $bytes[$i+2] -eq 0x50 -and $bytes[$i+3] -eq 0x31 -and $bytes[$i+4] -eq 1) { $npp = $i }
+    if ($bytes[$i] -eq 0x4E -and $bytes[$i+1] -eq 0x50 -and $bytes[$i+2] -eq 0x50 -and $bytes[$i+3] -eq 0x31 -and $bytes[$i+4] -in @(1,2)) { $npp = $i }
   }
-  $bytes[$npp + 96] = $bytes[$npp + 96] -bxor 0xFF
+  $nppVer = [BitConverter]::ToUInt32($bytes, $npp + 4)
+  $licBlobOff = if ($nppVer -ge 2) { 128 } else { 96 }
+  $bytes[$npp + $licBlobOff] = $bytes[$npp + $licBlobOff] -bxor 0xFF
   [IO.File]::WriteAllBytes($licBad, $bytes)
   $null = & $licBad 2>&1
   if ($LASTEXITCODE -ne 0) { Write-Host '[ OK ] x64_lic_bad (rejected)' } else { Write-Host '[FAIL] x64_lic_bad : accepted a tampered license'; $script:fail++ }
@@ -448,7 +450,7 @@ if (Test-Path $vmBad) {
   $npp = -1
   for ($i = 0; $i -lt $bytes.Length - 5; $i++) {
     if ($bytes[$i] -eq 0x4E -and $bytes[$i+1] -eq 0x50 -and $bytes[$i+2] -eq 0x50 -and
-        $bytes[$i+3] -eq 0x31 -and $bytes[$i+4] -eq 1) { $npp = $i; break }
+        $bytes[$i+3] -eq 0x31 -and $bytes[$i+4] -in @(1,2)) { $npp = $i; break }
   }
   if ($npp -ge 0) {
     $descOff  = [BitConverter]::ToUInt32($bytes, $npp + 20)
