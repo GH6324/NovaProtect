@@ -119,6 +119,19 @@ public sealed partial class ProtectPage : Page
         }
     }
 
+    private async void CopyMachineId_Click(object sender, RoutedEventArgs e)
+    {
+        var result = await _protector.InspectAsync(string.Empty, "-machineid");
+        if (!result.Success)
+        {
+            await ShowDialogAsync("读取本机 ID 失败", result.Output, true);
+            return;
+        }
+        var id = result.Output.Trim();
+        ActivationBindingBox.Text = id;
+        AppendLog($"已读取本机激活 ID：{id}（已填入激活/硬件绑定框）");
+    }
+
     private void SetInputPath(string path)
     {
         InputPathBox.Text = path;
@@ -336,6 +349,9 @@ public sealed partial class ProtectPage : Page
             MemoryProtection = MemoryProtectionSwitch.IsOn,
             ImportProtection = ImportProtectionSwitch.IsOn,
             ResourceProtection = ResourceProtectionSwitch.IsOn,
+            SandboxGuard = SandboxGuardSwitch.IsOn,
+            AntiDump = AntiDumpSwitch.IsOn,
+            EnvCheck = EnvCheckSwitch.IsOn,
             PackSections = PackSectionsSwitch.IsOn,
             EncryptSections = EncryptSectionsSwitch.IsOn,
             StripDebugInfo = StripDebugSwitch.IsOn,
@@ -565,6 +581,9 @@ public sealed partial class ProtectPage : Page
             MemoryProtectionSwitch.IsOn = options.MemoryProtection;
             ImportProtectionSwitch.IsOn = options.ImportProtection;
             ResourceProtectionSwitch.IsOn = options.ResourceProtection;
+            SandboxGuardSwitch.IsOn = options.SandboxGuard;
+            AntiDumpSwitch.IsOn = options.AntiDump;
+            EnvCheckSwitch.IsOn = options.EnvCheck;
             PackSectionsSwitch.IsOn = options.PackSections;
             EncryptSectionsSwitch.IsOn = options.EncryptSections;
             StripDebugSwitch.IsOn = options.StripDebugInfo;

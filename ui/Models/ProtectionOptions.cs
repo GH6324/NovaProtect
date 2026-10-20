@@ -79,6 +79,9 @@ public sealed class ProtectionOptions
     public int AntiDebugLevel { get; set; } = 2;
     public int AntiVmLevel { get; set; }
     public bool MemoryProtection { get; set; }
+    public bool SandboxGuard { get; set; }
+    public bool AntiDump { get; set; }
+    public bool EnvCheck { get; set; }
     public bool ImportProtection { get; set; }
     public bool ResourceProtection { get; set; }
     public bool PackSections { get; set; } = true;

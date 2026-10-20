@@ -43,6 +43,9 @@ public sealed partial class ProtectorService
         Flag(start, options.MemoryProtection, "-memory");
         Flag(start, options.ImportProtection, "-imports");
         Flag(start, options.ResourceProtection, "-resources");
+        Flag(start, options.SandboxGuard, "-sandbox-guard");
+        Flag(start, options.AntiDump, "-anti-dump");
+        Flag(start, options.EnvCheck, "-env-check");
         Flag(start, !options.PackSections, "-nopack");
         Flag(start, !options.EncryptSections, "-noencrypt");
         Flag(start, !options.StripDebugInfo, "-keepdebug");

@@ -176,6 +176,9 @@
                             <ToggleSwitch x:Name="MemoryProtectionSwitch" Header="内存完整性保护" />
                             <ToggleSwitch x:Name="ImportProtectionSwitch" Header="导入表保护" />
                             <ToggleSwitch x:Name="ResourceProtectionSwitch" Header="资源区段保护" />
+                            <ToggleSwitch x:Name="SandboxGuardSwitch" Header="反沙箱检测（重点反微步云沙箱）" />
+                            <ToggleSwitch x:Name="AntiDumpSwitch" Header="反内存转储" />
+                            <ToggleSwitch x:Name="EnvCheckSwitch" Header="交互桌面环境自检" />
                             <TextBlock Text="资源区段加密时会保留程序图标，加密后资源管理器中显示的图标与原文件一致。"
                                        Style="{StaticResource SubtleTextStyle}" FontSize="12" />
                         </StackPanel>
@@ -221,8 +224,21 @@
                                      Style="{StaticResource RoundedTextBoxStyle}" />
                             <PasswordBox x:Name="LicenseKeyBox" Grid.Column="1" Header="许可密钥"
                                          PlaceholderText="可选" Style="{StaticResource RoundedPasswordBoxStyle}" />
-                            <TextBox x:Name="ActivationBindingBox" Grid.Column="2" Header="激活/硬件绑定"
-                                     PlaceholderText="16 位机器 ID 或 auto" Style="{StaticResource RoundedTextBoxStyle}" />
+                            <Grid Grid.Column="2" RowSpacing="4">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <TextBox x:Name="ActivationBindingBox" Header="激活/硬件绑定（一机一码）"
+                                         PlaceholderText="16 位机器 ID 或 auto" Style="{StaticResource RoundedTextBoxStyle}" />
+                                <Button Grid.Row="1" HorizontalAlignment="Right" Style="{StaticResource RoundedButtonStyle}"
+                                        Click="CopyMachineId_Click">
+                                    <StackPanel Orientation="Horizontal" Spacing="6">
+                                        <FontIcon Glyph="&#xE8F1;" FontSize="13" />
+                                        <TextBlock Text="读取本机 ID" />
+                                    </StackPanel>
+                                </Button>
+                            </Grid>
                         </Grid>
                         <InfoBar IsOpen="True" IsClosable="False" Severity="Informational"
                                  Title="能力边界"

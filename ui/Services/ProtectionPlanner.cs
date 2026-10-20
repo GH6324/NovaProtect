@@ -33,6 +33,9 @@ public static class ProtectionPlanner
         AddRequest(plan, options.MemoryProtection, "内存完整性");
         AddRequest(plan, options.AntiDebugLevel > 0, $"反调试 {options.AntiDebugLevel}");
         AddRequest(plan, options.AntiVmLevel > 0, $"环境检查 {options.AntiVmLevel}");
+        AddRequest(plan, options.SandboxGuard, "反沙箱检测");
+        AddRequest(plan, options.AntiDump, "反内存转储");
+        AddRequest(plan, options.EnvCheck, "交互桌面环境自检");
         AddRequest(plan, options.StripDebugInfo, "调试目录裁剪");
         AddRequest(plan, options.StripRelocations, "重定位裁剪");
         AddRequest(plan, options.StripExports, "导出裁剪");
@@ -103,6 +106,9 @@ public static class ProtectionPlanner
         if (nativeX64)
         {
             AddEffective(plan, options.MemoryProtection, "内存完整性");
+            AddEffective(plan, options.SandboxGuard, "反沙箱检测");
+            AddEffective(plan, options.AntiDump, "反内存转储");
+            AddEffective(plan, options.EnvCheck, "交互桌面环境自检");
             AddEffective(plan, options.AntiDebugLevel > 0, $"反调试 {options.AntiDebugLevel}");
             AddEffective(plan, options.AntiVmLevel > 0, $"环境检查 {options.AntiVmLevel}");
             AddEffective(plan, !string.IsNullOrWhiteSpace(options.LicenseKey), "运行时许可");
@@ -222,6 +228,7 @@ public static class ProtectionPlanner
             new("导入虚拟化", "✓", "✓", "✕", "✕", "剥离 loader 可见 Import Directory，并在运行时重建 IAT。"),
             new("内存完整性", "✓ loader", "✓ loader/runtime", "✕", "✕", "x86/x64 均验证恢复后的 region；x64 另有 protection runtime 完整性表。"),
             new("反调试/环境检查", "✓ loader", "✓ loader/runtime", "✕", "✕", "能力按架构走不同运行时路径。"),
+            new("反沙箱/反转储/桌面自检", "✕", "✓ runtime", "✕", "✕", "反微步云沙箱评分、内存转储自检与交互桌面环境检查，打包时独立开关。"),
             new("运行时许可/激活", "✕", "✓", "✕", "✕", "激活绑定为 x64 进程级前置校验。"),
             new("重定位裁剪", "△ EXE", "△ EXE", "✕", "✕", trimNote),
             new("导出裁剪", "✓ EXE", "✓ EXE", "✕", "✕", trimNote),
