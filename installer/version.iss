@@ -1,2 +1,2 @@
-#define MyAppVersion "2.2.7"
-#define MyAppVersionComments "移除账号与会员系统；资源加密保留图标；修复在线更新"
+#define MyAppVersion "2.3.0"
+#define MyAppVersionComments "新增 SDK 函数加密；强化反沙箱与反调试"
