@@ -104,7 +104,8 @@ static uint8_t jccWire(uint8_t cc, uint8_t prefixes) {
 
 VMLoweredBlock VMTranslator::translate(const uint8_t* code, size_t size,
                                        uint64_t guestRip, uint64_t imageBase,
-                                       uint8_t complexity, uint8_t mutationLevel) {
+                                       uint8_t complexity, uint8_t mutationLevel,
+                                       bool target64) {
     (void)imageBase;
     VMLoweredBlock out;
     out.vmSp = SCRATCH_B; // guest RSP stays mapped to VM_R4; message says SP reg
@@ -141,6 +142,29 @@ VMLoweredBlock VMTranslator::translate(const uint8_t* code, size_t size,
 
         bool handled = true;
         uint8_t rexW = (insn.prefixes & PREFIX_REX_W) ? 1 : 0;
+
+        // 32-bit operand forms in a 64-bit stream: the wire VM widens
+        // every operation to 64 bits, so it cannot reproduce the
+        // zero-extension of the upper half or the 32-bit carry/sign
+        // flags a native "add eax, imm" produces.  Terminate here so
+        // the packer keeps the region native instead of virtualizing
+        // code whose result would depend on the incoming upper bits.
+        if (target64 && !rexW) {
+            using C = InsnCategory;
+            switch (insn.category) {
+            case C::MOV: case C::MOVZX: case C::MOVSX: case C::LEA:
+            case C::ADD: case C::SUB: case C::AND: case C::OR: case C::XOR:
+            case C::INC: case C::DEC: case C::NEG: case C::NOT:
+            case C::SHL: case C::SHR: case C::SAR:
+            case C::CMP: case C::TEST:
+                skipped++;
+                out.skipReason = "32-bit operand form";
+                break;
+            default:
+                break;
+            }
+            if (skipped) break;
+        }
 
         // Helper for reg-reg / reg-imm binary ALU ops with a known wire op.
         auto needGPR = [&](Reg r) { return isGPR(r); };

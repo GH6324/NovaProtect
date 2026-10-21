@@ -62,6 +62,14 @@ static void print_usage(const char* prog) {
     printf("  -noencrypt         Store packed regions without payload encryption\n");
     printf("  -stripreloc        Remove relocation directory and disable ASLR (EXE only)\n");
     printf("  -stripexport       Remove export directory (EXE only)\n");
+    printf("Runtime (x64 protection runtime):\n");
+    printf("  -sandbox-guard     Cumulative sandbox scoring (blocks online-analysis hosts)\n");
+    printf("  -sandbox-threshold <0-100>  Block when sandbox score >= value (default 40)\n");
+    printf("  -anti-dump         Live-memory dump self-check\n");
+    printf("  -env-check         Interactive-desktop environment check\n");
+    printf("  -env-threshold <0-100>  Block when headless env score >= value (default 7)\n");
+    printf("  -min-cpu <n> | -min-ram-mb <n> | -min-uptime-ms <n>\n");
+    printf("  -min-screen-w <n> | -min-screen-h <n> | -min-monitor <n>\n");
     printf("Additional:\n");
     printf("  -watermark <text>  Embed watermark\n");
     printf("  -script <file>     Simple key=value protection script\n");
@@ -69,6 +77,7 @@ static void print_usage(const char* prog) {
     printf("  -activation <id>   Bind x64 runtime to 64-bit machine id (hex or auto)\n");
     printf("  -machineid         Print this machine's activation id\n");
     printf("  -region <spec>     SDK region rule: start-end-mode-vm-mut-lock\n");
+    printf("  -func <spec>       Scanned function rule: start-end-mode-vm-mut-lock (repeatable)\n");
     printf("  -vf <file>         Embed a virtual file (repeatable)\n");
     printf("  -info              Show PE info\n");
     printf("Inspection:\n");
@@ -190,7 +199,7 @@ static uint64_t current_machine_id() {
     h = fnv64_bytes(&mg, sizeof(mg), h);
     return h;
 }
-static bool parse_region_spec(const std::string& spec, FunctionProtect& out, std::string& error) {
+static bool parse_region_spec(const std::string& spec, FunctionSource source, FunctionProtect& out, std::string& error) {
     std::vector<std::string> parts;
     size_t pos = 0;
     while (pos <= spec.size()) {
@@ -216,6 +225,7 @@ static bool parse_region_spec(const std::string& spec, FunctionProtect& out, std
     if (!parse_range(parts[3], 0, 10, out.vm_complexity)) { error = "region VM complexity must be 0..10"; return false; }
     if (!parse_range(parts[4], 0, 3, out.vm_mutation)) { error = "region mutation must be 0..3"; return false; }
     out.vm_lock_to_key = parse_bool(parts[5]);
+    out.source = source;
     return true;
 }
 
@@ -255,6 +265,7 @@ static bool apply_option(PackerConfig& config, const std::string& key, const std
     else if (key == "sandbox-threshold" || key == "sbox-thr") { if (!parse_range_u32(value, 0, 100, config.sandbox_score_threshold)) { error = "sandbox threshold must be 0..100"; return false; } }
     else if (key == "anti-dump" || key == "antidump") config.enable_anti_dump = parse_bool(value);
     else if (key == "env-check" || key == "envcheck") config.enable_env_check = parse_bool(value);
+    else if (key == "env-threshold" || key == "envthr") { if (!parse_range_u32(value, 0, 100, config.env_score_threshold)) { error = "env threshold must be 0..100"; return false; } }
     else if (key == "min-cpu" || key == "mincpu") { if (!parse_range_u32(value, 1, 256, config.min_cpu_count)) { error = "min-cpu must be 1..256"; return false; } }
     else if (key == "min-ram-mb" || key == "minram") { if (!parse_range_u32(value, 0, 1048576, config.min_ram_mb)) { error = "min-ram-mb must be 0..1048576"; return false; } }
     else if (key == "min-uptime-ms" || key == "minuptime") { if (!parse_range_u32(value, 0, 4294967295ul, config.min_uptime_ms)) { error = "min-uptime-ms must be 0..4294967295"; return false; } }
@@ -352,13 +363,22 @@ int wmain(int argc, wchar_t* argv[]) {
         else if (arg == "-activation" && i + 1 < argc) { config.enable_activation = true; config.activation_key = narrowArgv[++i]; }
         else if (arg == "-region" && i + 1 < argc) {
             FunctionProtect region;
-            if (!parse_region_spec(narrowArgv[++i], region, parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; }
+            if (!parse_region_spec(narrowArgv[++i], FunctionSource::SdkMarker, region, parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; }
             config.function_regions.push_back(region);
+        }
+        else if (arg == "-func" && i + 1 < argc) {
+            // Scanned function rule: start-end-mode-vm-mut-lock (same shape
+            // as -region, but the range comes from the function scanner and
+            // does not require SDK marker wrapping).
+            FunctionProtect func;
+            if (!parse_region_spec(narrowArgv[++i], FunctionSource::ScanFunction, func, parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; }
+            config.function_regions.push_back(func);
         }
         else if (arg == "-vf" && i + 1 < argc) { if (!apply_option(config, "vf", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
         else if (arg == "-sandbox-guard" || arg == "-sandbox") { config.enable_sandbox_guard = true; }
         else if (arg == "-anti-dump" || arg == "-antidump") { config.enable_anti_dump = true; }
         else if (arg == "-env-check" || arg == "-envcheck") { config.enable_env_check = true; }
+        else if (arg == "-env-threshold" && i + 1 < argc) { if (!apply_option(config, "env-threshold", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
         else if (arg == "-sandbox-threshold" && i + 1 < argc) { if (!apply_option(config, "sandbox-threshold", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
         else if (arg == "-min-cpu" && i + 1 < argc) { if (!apply_option(config, "min-cpu", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
         else if (arg == "-min-ram-mb" && i + 1 < argc) { if (!apply_option(config, "min-ram-mb", narrowArgv[++i], parse_error)) { printf("Error: %s\n", parse_error.c_str()); return 2; } }
@@ -429,7 +449,7 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     for (const auto& region : config.function_regions) {
         if (region.vm_lock_to_key && !config.enable_activation) {
-            printf("Error: activation-locked SDK region requires -activation\n");
+            printf("Error: activation-locked region requires -activation\n");
             return 2;
         }
     }

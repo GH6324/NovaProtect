@@ -208,32 +208,49 @@ bool Disassembler::parseModRM(const uint8_t* code, size_t max_len, size_t& offse
         
         // Parse SIB byte if needed
         uint8_t base_reg = rm;
-        if (rm == 4 && mod != 0) {
-            // SIB byte follows
+        bool has_sib = false;
+        uint8_t sib = 0;
+        if (rm == 4 && mod != 3) {
+            // SIB byte follows for every mod except 3, including mod == 0
+            // (the [index*scale + disp32] encoding - lea 0x0(,%rdx,8)).
             if (offset >= max_len) return false;
-            uint8_t sib = code[offset++];
+            sib = code[offset++];
             insn.sib = sib;
             insn.has_sib = true;
+            has_sib = true;
             base_reg = sib & 7;
             uint8_t index_reg = (sib >> 3) & 7;
             uint8_t scale_bits = (sib >> 6) & 3;
-            
-            insn.src.index = reg_util::regFromIndex(index_reg, rex_x, is64);
+
+            // index == 4 (100b) means "no index register". Report it as RIP
+            // so the register-mask scan (which only looks at GPR 0..15)
+            // skips it instead of seeing a phantom RSP.
+            insn.src.index = index_reg == 4
+                ? Reg::RIP
+                : reg_util::regFromIndex(index_reg, rex_x, is64);
             insn.src.scale = 1 << scale_bits;
         }
-        
+
         if (rm == 5 && mod == 0) {
             // RIP-relative addressing
             insn.src.type = OperandType::MemoryRIP;
             insn.src.base = Reg::RIP;
+        } else if (has_sib && base_reg == 5 && mod == 0) {
+            // [index*scale + disp32]: the SIB base field 101 with mod == 0
+            // means there is no base register, only a 32-bit displacement.
+            // Report RIP so the mask scan skips a phantom RBP.
+            insn.src.base = Reg::RIP;
         } else {
             insn.src.base = reg_util::regFromIndex(base_reg, rex_b, is64);
         }
-        
+
         // Parse displacement
         int disp_size = 0;
         switch (mod) {
-        case 0: disp_size = (rm == 5) ? 4 : 0; break;
+        case 0:
+            if (rm == 5) disp_size = 4;                        // RIP-relative
+            else if (has_sib && base_reg == 5) disp_size = 4;  // SIB no-base
+            break;
         case 1: disp_size = 1; break;
         case 2: disp_size = 4; break;
         }
@@ -277,14 +294,25 @@ bool Disassembler::parseImmediate(const uint8_t* code, size_t max_len, size_t& o
                                    DisasmInsn& insn, int imm_size) {
     if (offset + imm_size > max_len) return false;
     insn.has_immediate = true;
+    // In 64-bit mode (REX.W) every immediate shorter than 64 bits is
+    // sign-extended by the CPU.  Store the sign-extended value so the VM
+    // translator emits the same constant the hardware would use; without
+    // this, mutated forms such as "add rax,imm -> sub rax,-imm" would be
+    // lowered with a zero-extended (positive) immediate and compute the
+    // wrong result.
+    bool is64 = (insn.prefixes & PREFIX_REX_W) != 0;
     if (imm_size == 1) {
-        insn.src.immediate = code[offset++];
+        insn.src.immediate = is64 ? (uint64_t)(int64_t)(int8_t)code[offset]
+                                  : (uint64_t)code[offset];
+        offset++;
     } else if (imm_size == 2) {
         uint16_t i; memcpy(&i, &code[offset], 2);
-        insn.src.immediate = i; offset += 2;
+        insn.src.immediate = is64 ? (uint64_t)(int64_t)(int16_t)i : (uint64_t)i;
+        offset += 2;
     } else if (imm_size == 4) {
         uint32_t i; memcpy(&i, &code[offset], 4);
-        insn.src.immediate = i; offset += 4;
+        insn.src.immediate = is64 ? (uint64_t)(int64_t)(int32_t)i : (uint64_t)i;
+        offset += 4;
     } else if (imm_size == 8) {
         uint64_t i; memcpy(&i, &code[offset], 8);
         insn.src.immediate = i; offset += 8;

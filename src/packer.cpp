@@ -993,6 +993,340 @@ static std::vector<uint8_t> npBuildLicenseProgram(size_t blob_len,
     return bc;
 }
 
+// Runtime np_vm_install clamps its table to 64 entries; keep the packer in
+// step so a "protect every function" run does not silently drop regions.
+static constexpr size_t kMaxVmRegions = 64;
+
+// Lower one code range [start, end) to VM bytecode. Shared by the SDK marker
+// path and the scanned-function path. See include/packer.h for the contract.
+bool Packer::vmLowerRegion(PELib& pe, std::vector<uint8_t>& data, std::vector<VmRegion>& vm_regions,
+                           std::mt19937_64& rng, uint32_t start, uint32_t end,
+                           const FunctionProtect* selected, const char* origin) {
+    (void)origin;
+    if (end <= start) return false;
+    uint32_t len = end - start;
+    if (vm_regions.size() >= kMaxVmRegions) {
+        progress(57, "VM skip region: region table full (64 max)");
+        return false;
+    }
+
+    const bool mut = config_.enable_mutation && config_.mutation_strength > 0;
+    const bool region_vm = !selected || selected->level == ProtectLevel::None ||
+                           selected->level == ProtectLevel::Virtualization ||
+                           selected->level == ProtectLevel::Ultra;
+    if (!region_vm) return false;   // caller filters this earlier; defensive
+    const bool region_mut = mut &&
+        (!selected || selected->level == ProtectLevel::None || selected->level == ProtectLevel::Ultra);
+    const uint8_t region_complexity = selected && selected->vm_complexity > 0
+        ? selected->vm_complexity : config_.vm_default_complexity;
+    const uint8_t region_mutation = selected ? selected->vm_mutation : config_.mutation_strength;
+
+    // Locate the bytes in the original section data.
+    const uint8_t* code = nullptr;
+    for (size_t si = 0; si < pe.sectionCount() && !code; si++) {
+        const auto& s = pe.section(si);
+        if (start < s.VirtualAddress) continue;
+        if ((uint64_t)start + len > (uint64_t)s.VirtualAddress + s.VirtualSize) continue;
+        auto& d = pe.sectionData(si);
+        size_t off = start - s.VirtualAddress;
+        if (off + len <= d.size()) code = d.data() + off;
+    }
+    if (!code) {
+        progress(57, "VM skip region: outside section bounds");
+        return false;
+    }
+
+    // A scanned function body ends with RET. The wire VM has no return
+    // instruction and the trampoline jumps to the byte after the region, so
+    // lower only up to the first RET and leave the terminator native: the
+    // tail jump lands exactly on it and the original return executes. SDK
+    // markers never contain a RET (their END marker is NOPs), so this only
+    // applies to the function-scanner path.
+    if (selected && selected->source == FunctionSource::ScanFunction) {
+        Disassembler rdis;
+        uint32_t off = 0;
+        uint32_t first_ret = 0;
+        while (off < len) {
+            DisasmInsn insn;
+            uint32_t ilen = rdis.disassemble(code + off, len - off, insn);
+            if (!ilen) break;
+            if (insn.category == InsnCategory::RET) { first_ret = off; break; }
+            off += ilen;
+        }
+        if (first_ret == 0) {
+            // Either the first instruction is the RET (nothing to lower) or
+            // no RET decodes before the end of the range.
+            progress(57, "VM skip region: no function body before RET");
+            return false;
+        }
+        len = first_ret;
+    }
+
+    // Validate that the whole region decodes cleanly and collect
+    // the guest registers the block touches. The trampoline only
+    // has to preserve those. RSP/RBP own its frame and R15 is the
+    // interpreter stack pointer, so those must not appear.
+    uint32_t mask = 0;
+    bool bad = false;
+    {
+        Disassembler dis;
+        uint32_t off2 = 0;
+        while (off2 < len) {
+            DisasmInsn insn;
+            uint32_t ilen = dis.disassemble(code + off2, len - off2, insn);
+            if (!ilen) { bad = true; break; }
+            Operand ops[3] = { insn.dst, insn.src, insn.extra };
+            for (int k = 0; k < 3; k++) {
+                uint8_t rg = (uint8_t)ops[k].reg;
+                if (rg <= 15) mask |= (1u << rg);
+                if (ops[k].type == OperandType::Memory) {
+                    uint8_t rb = (uint8_t)ops[k].base, ri = (uint8_t)ops[k].index;
+                    if (rb <= 15) mask |= (1u << rb);
+                    if (ri <= 15) mask |= (1u << ri);
+                }
+            }
+            off2 += ilen;
+        }
+        if (off2 != len) bad = true;
+    }
+    if (bad || mask == 0) {
+        progress(57, "VM skip region: undecodable or empty");
+        return false;
+    }
+    if (mask & ((1u << 4) | (1u << 5))) {   // RSP / RBP
+        progress(57, "VM skip region: uses RSP/RBP");
+        return false;
+    }
+
+    // ---- pre-translation code mutation -------------------------
+    // Feed the region through the mutation engine first. The
+    // mutated stream is then lowered to wire bytecode exactly like
+    // the original, so the interpreter sees a semantically
+    // equivalent but structurally different program. If any step
+    // fails we fall back to the unmutated translation.
+    const uint8_t* translate_src = code;
+    uint32_t translate_len = len;
+    std::vector<uint8_t> mutated_bytes;
+    uint32_t used_mask = mask;
+    uint32_t mutation_count = 0;
+    if (region_mut && len >= 16) {
+        std::vector<NativeInsn> stream;
+        {
+            Disassembler dis;
+            uint32_t off3 = 0;
+            while (off3 < len) {
+                DisasmInsn insn;
+                uint32_t ilen = dis.disassemble(code + off3, len - off3, insn);
+                if (!ilen) break;
+                NativeInsn ni;
+                ni.bytes = insn.bytes;
+                ni.rva = start + off3;
+                ni.length = insn.length;
+                ni.opcode = insn.opcode;
+                ni.modrm = insn.modrm;
+                ni.sib = insn.sib;
+                ni.is_jcc = insn.category == InsnCategory::JCC;
+                ni.is_call = insn.category == InsnCategory::CALL;
+                ni.is_ret = insn.category == InsnCategory::RET;
+                ni.is_push = insn.category == InsnCategory::PUSH;
+                ni.is_pop = insn.category == InsnCategory::POP;
+                ni.is_mov = insn.category == InsnCategory::MOV;
+                ni.is_arith = insn.category == InsnCategory::ADD ||
+                              insn.category == InsnCategory::SUB ||
+                              insn.category == InsnCategory::MUL ||
+                              insn.category == InsnCategory::IMUL;
+                ni.is_logic = insn.category == InsnCategory::AND ||
+                              insn.category == InsnCategory::OR ||
+                              insn.category == InsnCategory::XOR ||
+                              insn.category == InsnCategory::NOT;
+                ni.is_shift = insn.category == InsnCategory::SHL ||
+                              insn.category == InsnCategory::SHR ||
+                              insn.category == InsnCategory::SAR;
+                ni.is_test = insn.category == InsnCategory::TEST ||
+                             insn.category == InsnCategory::CMP;
+                stream.push_back(std::move(ni));
+                off3 += ilen;
+            }
+        }
+        // The VM only understands a small register-only subset, so
+        // the VM mutation pass keeps substitutions only: garbage
+        // injection and opaque predicates expand the stream with
+        // encodings the translator cannot lower, which would make
+        // every region fall back to the unmutated program.
+        MutationEngine mutEngine;
+        mutEngine.setStrength(static_cast<MutationStrength>(std::min<uint8_t>(region_mutation, 3)));
+        mutEngine.setInjectGarbage(false);
+        mutEngine.setReorder(false);
+        std::vector<NativeInsn> mutated_stream;
+        {
+            Disassembler dchk;
+            auto supported = [&](const NativeInsn& ni) -> bool {
+                if (ni.bytes.empty()) return false;
+                DisasmInsn di;
+                if (!dchk.disassemble(ni.bytes.data(), ni.bytes.size(), di)) return false;
+                using C = InsnCategory;
+                switch (di.category) {
+                case C::MOV: case C::LEA:
+                case C::ADD: case C::SUB: case C::AND: case C::OR: case C::XOR:
+                case C::CMP: case C::TEST:
+                case C::INC: case C::DEC: case C::NEG: case C::NOT:
+                case C::SHL: case C::SHR: case C::SAR:
+                case C::NOP:
+                    return true;
+                default:
+                    return false;
+                }
+            };
+            for (const auto& insn : stream) {
+                auto sub = mutEngine.mutate({insn});
+                bool ok = !sub.empty() && !sub[0].bytes.empty() && sub[0].mutated;
+                if (ok) {
+                    for (const auto& mi : sub) {
+                        if (!supported(mi)) { ok = false; break; }
+                    }
+                }
+                if (ok) {
+                    mutated_stream.insert(mutated_stream.end(), sub.begin(), sub.end());
+                    mutation_count++;
+                } else {
+                    mutated_stream.push_back(insn);
+                }
+            }
+        }
+        progress(57, std::string("Mutation: ") + std::to_string(mutation_count) +
+                " substitutions accepted");
+
+        if (mutation_count > 0) {
+            for (const auto& mi : mutated_stream)
+                mutated_bytes.insert(mutated_bytes.end(),
+                                     mi.bytes.begin(), mi.bytes.end());
+            // Recompute the register mask on the mutated stream:
+            // the substitutions may touch registers the original
+            // never mentioned, and the trampoline must preserve
+            // every one of them.
+            uint32_t new_mask = 0;
+            bool new_bad = false;
+            Disassembler dis2;
+            uint32_t off4 = 0;
+            while (off4 < mutated_bytes.size()) {
+                DisasmInsn insn;
+                uint32_t ilen = dis2.disassemble(mutated_bytes.data() + off4,
+                                                 mutated_bytes.size() - off4, insn);
+                if (!ilen) { new_bad = true; break; }
+                Operand ops[3] = { insn.dst, insn.src, insn.extra };
+                for (int k = 0; k < 3; k++) {
+                    uint8_t rg = (uint8_t)ops[k].reg;
+                    if (rg <= 15) new_mask |= (1u << rg);
+                    if (ops[k].type == OperandType::Memory) {
+                        uint8_t rb = (uint8_t)ops[k].base, ri = (uint8_t)ops[k].index;
+                        if (rb <= 15) new_mask |= (1u << rb);
+                        if (ri <= 15) new_mask |= (1u << ri);
+                    }
+                }
+                off4 += ilen;
+            }
+            if (!new_bad && off4 == mutated_bytes.size() &&
+                !(new_mask & ((1u << 4) | (1u << 5))) && new_mask) {
+                translate_src = mutated_bytes.data();
+                translate_len = (uint32_t)mutated_bytes.size();
+                used_mask = new_mask;
+            } else {
+                mutated_bytes.clear();
+                mutation_count = 0;
+            }
+        }
+    }
+
+    VMLoweredBlock blk = VMTranslator::translate(translate_src, translate_len,
+                                                  pe.imageBase() + start,
+                                                  pe.imageBase(),
+                                                  region_complexity,
+                                                  region_mutation,
+                                                  pe.is64());
+    if (!blk.ok || blk.bytecode.empty()) {
+        if (mutation_count > 0) {
+            // The mutated stream did not lower cleanly; retry the
+            // original code so the region keeps its protection.
+            mutated_bytes.clear();
+            used_mask = mask;
+            blk = VMTranslator::translate(code, len,
+                                           pe.imageBase() + start,
+                                           pe.imageBase(),
+                                           region_complexity,
+                                           region_mutation,
+                                           pe.is64());
+            mutation_count = 0;
+        }
+        if (!blk.ok || blk.bytecode.empty()) {
+            progress(57, std::string("VM skip region: ") + blk.skipReason);
+            return false;
+        }
+    }
+    mask = used_mask;
+
+    // ---- trampoline clobber set ---------------------------------
+    // The runtime trampoline loads the interpreter arguments into
+    // rcx (bytecode), edx (length), r8 (reverse table) and r9
+    // (register file) before calling np_vm_run, and np_vm_run itself
+    // is compiled C that returns through rax and uses r10/r11 as
+    // scratch.  The save/restore loop in np_vm_install only covers
+    // registers present in this mask, so every register the call
+    // sequence can destroy must be forced in here even when the guest
+    // block never mentions it: compilers legally keep live values in
+    // caller-saved registers across a call to a function whose body
+    // they can see (interprocedural register allocation), and the
+    // virtualized region must honour exactly the same contract the
+    // original code did.  rbx/rbp/r12-r15/rdi/rsi are preserved by
+    // np_vm_run itself (verified against its disassembly), and rbp is
+    // additionally anchored by the trampoline frame, so they need no
+    // special handling.
+    mask |= (1u << 0) | (1u << 1) | (1u << 2) | (1u << 8) |
+            (1u << 9) | (1u << 10) | (1u << 11);
+
+    // ---- post-translation obfuscation --------------------------
+    // Dead-register junk emission + control-flow flattening.
+    // Derive the logical->physical opcode table from the reverse
+    // table so we can re-encode the obfuscated stream.
+    if (region_complexity > 0) {
+        uint8_t mapping[256] = {0};
+        for (int p = 0; p < 256; p++) {
+            uint8_t logical = blk.reverse[(size_t)p];
+            if (logical < WIRE_COUNT) mapping[logical] = (uint8_t)p;
+        }
+        blk.bytecode = vmObfuscate(blk.bytecode, blk.reverse.data(),
+                                    mapping, mask,
+                                    region_complexity);
+    }
+
+    // Room for the runtime-generated trampoline (see np_vm_install).
+    uint32_t need = 51 + 10 * (uint32_t)__builtin_popcount(mask);
+    if (len < need + 16) {
+        progress(57, "VM skip region: too small for trampoline");
+        return false;
+    }
+
+    // Multi-layer encryption: the bytecode is stored encrypted
+    // and the runtime decrypts it at load time.
+    uint32_t nonce = (uint32_t)rng();
+    layeredEncrypt(blk.bytecode.data(), blk.bytecode.size(),
+                   nonce, start);
+
+    uint32_t bc_off = (uint32_t)data.size();
+    data.insert(data.end(), blk.bytecode.begin(), blk.bytecode.end());
+    while (data.size() & 7) data.push_back(0);
+    uint32_t rev_off = (uint32_t)data.size();
+    data.insert(data.end(), blk.reverse.begin(), blk.reverse.end());
+    while (data.size() & 7) data.push_back(0);
+
+    vm_regions.push_back({start, len, bc_off,
+                          (uint32_t)blk.bytecode.size(), rev_off, mask, nonce});
+    if (result_) result_->vm_instructions += blk.insnsTranslated;
+    if (result_ && mutation_count > 0) result_->mutation_applied += mutation_count;
+    progress(58, std::string("VM translated ") + std::to_string(blk.insnsTranslated) +
+            (mutation_count > 0 ? " instructions (mutated x" + std::to_string(mutation_count) + ")" : " instructions"));
+    return true;
+}
+
 bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data) {
     if (!pe.is64()) return true;              // x64 runtime only
     if (!config_.enable_protection_runtime) return true;
@@ -1063,7 +1397,10 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
     npPatch64(data, 24, tim ? 8000ull : 0ull);
     npPatch64(data, 32, expected_mut_hash);
     if (act) npPatch64(data, 80, std::strtoull(config_.activation_key.c_str(), nullptr, 16));
-    if (sandbox) npPatch32(data, 96, config_.sandbox_score_threshold ? config_.sandbox_score_threshold : 34u);
+    /* Honour an explicit 0: the runtime gate skips scoring at 0, which is
+     * the documented "guard on, never block" mode. The PackerConfig default
+     * (40) still applies when the option is never set. */
+    if (sandbox) npPatch32(data, 96, config_.sandbox_score_threshold);
     if (envchk) {
         npPatch32(data, 100, config_.min_cpu_count);
         npPatch32(data, 104, config_.min_ram_mb);
@@ -1071,6 +1408,7 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
         npPatch32(data, 112, config_.min_screen_width);
         npPatch32(data, 116, config_.min_screen_height);
         npPatch32(data, 120, config_.min_monitor_count);
+        npPatch32(data, 124, config_.env_score_threshold);   /* runtime falls back to 7 at 0 */
     }
 
     // ---- license program --------------------------------------------------
@@ -1122,19 +1460,21 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
     }
 
     // ---- VM virtualisation ------------------------------------------------
-    // Every NOVAPROTECT_BEGIN/END (or legacy NOVAPACK_BEGIN/END) pair is lowered to wire bytecode. At load time
-    // the runtime replaces the region body with a register-preserving
-    // trampoline that runs the interpreter, so the marked code never executes
+    // Two sources feed the VM translator:
+    //   1. NOVAPROTECT_BEGIN/END (or legacy NOVAPACK_BEGIN/END) marker pairs,
+    //      optionally filtered by the SDK object editor (-region).
+    //   2. Functions picked in the client's function scanner (-func), whose
+    //      RVA range is the whole function body and needs no marker.
+    // Either way the runtime replaces the region with a register-preserving
+    // trampoline that runs the interpreter, so the code never executes
     // natively. Regions the translator cannot express stay native.
-    struct VmRegion {
-        uint32_t rva, size, bc_off, bc_len, rev_off, reg_mask, nonce;
-    };
     std::vector<VmRegion> vm_regions;
     if (vm && pe.is64()) {
         auto markers = pe.findMarkers();
-        if (markers.empty()) {
-            progress(57, "VM enabled but no SDK markers found");
-        } else {
+        if (markers.empty() && config_.function_regions.empty()) {
+            progress(57, "VM enabled but no SDK markers or scanned functions found");
+        }
+        if (!markers.empty()) {
             progress(57, std::string("Found ") + std::to_string(markers.size()) + " SDK markers");
             for (size_t i = 0; i < markers.size(); i++) {
                 if (markers[i].type != 0) continue;
@@ -1147,287 +1487,55 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
                 uint32_t end_rva = markers[j].rva;
                 i = j;
                 if (end_rva <= start) continue;
-                uint32_t len = end_rva - start;
 
                 const FunctionProtect* selected = nullptr;
                 for (const auto& rule : config_.function_regions) {
+                    if (rule.source != FunctionSource::SdkMarker) continue;
                     if (rule.rva_start == start && rule.rva_end == end_rva) {
                         selected = &rule;
                         break;
                     }
                 }
                 if (!config_.function_regions.empty() && !selected) {
-                    progress(57, "VM skip region: not selected in SDK object editor");
-                    continue;
+                    // Only skip when the editor actually governs markers: a
+                    // function-scanner-only run must not silence markers.
+                    bool marker_governed = false;
+                    for (const auto& rule : config_.function_regions)
+                        if (rule.source == FunctionSource::SdkMarker) { marker_governed = true; break; }
+                    if (marker_governed) {
+                        progress(57, "VM skip region: not selected in SDK object editor");
+                        continue;
+                    }
                 }
                 if (selected && selected->name == "skip") {
                     progress(57, "VM skip region: disabled by SDK object editor");
                     continue;
                 }
-                const bool region_vm = !selected || selected->level == ProtectLevel::None ||
-                                       selected->level == ProtectLevel::Virtualization ||
-                                       selected->level == ProtectLevel::Ultra;
-                const bool region_mut = region_vm && mut &&
-                    (!selected || selected->level == ProtectLevel::None || selected->level == ProtectLevel::Ultra);
-                const uint8_t region_complexity = selected && selected->vm_complexity > 0
-                    ? selected->vm_complexity : config_.vm_default_complexity;
-                const uint8_t region_mutation = selected ? selected->vm_mutation : config_.mutation_strength;
-
-                // Locate the bytes in the original section data.
-                const uint8_t* code = nullptr;
-                for (size_t si = 0; si < pe.sectionCount() && !code; si++) {
-                    const auto& s = pe.section(si);
-                    if (start < s.VirtualAddress) continue;
-                    if ((uint64_t)start + len > (uint64_t)s.VirtualAddress + s.VirtualSize) continue;
-                    auto& d = pe.sectionData(si);
-                    size_t off = start - s.VirtualAddress;
-                    if (off + len <= d.size()) code = d.data() + off;
-                }
-                if (!code) continue;
-
-                // Validate that the whole region decodes cleanly and collect
-                // the guest registers the block touches. The trampoline only
-                // has to preserve those. RSP/RBP own its frame and R15 is the
-                // interpreter stack pointer, so those must not appear.
-                uint32_t mask = 0;
-                bool bad = false;
-                {
-                    Disassembler dis;
-                    uint32_t off2 = 0;
-                    while (off2 < len) {
-                        DisasmInsn insn;
-                        uint32_t ilen = dis.disassemble(code + off2, len - off2, insn);
-                        if (!ilen) { bad = true; break; }
-                        Operand ops[3] = { insn.dst, insn.src, insn.extra };
-                        for (int k = 0; k < 3; k++) {
-                            uint8_t rg = (uint8_t)ops[k].reg;
-                            if (rg <= 15) mask |= (1u << rg);
-                            if (ops[k].type == OperandType::Memory) {
-                                uint8_t rb = (uint8_t)ops[k].base, ri = (uint8_t)ops[k].index;
-                                if (rb <= 15) mask |= (1u << rb);
-                                if (ri <= 15) mask |= (1u << ri);
-                            }
-                        }
-                        off2 += ilen;
-                    }
-                    if (off2 != len) bad = true;
-                }
-                if (bad || mask == 0) {
-                    progress(57, "VM skip region: undecodable or empty");
-                    continue;
-                }
-                if (mask & ((1u << 4) | (1u << 5))) {   // RSP / RBP
-                    progress(57, "VM skip region: uses RSP/RBP");
-                    continue;
-                }
-
-                // ---- pre-translation code mutation -------------------------
-                // Feed the region through the mutation engine first. The
-                // mutated stream is then lowered to wire bytecode exactly like
-                // the original, so the interpreter sees a semantically
-                // equivalent but structurally different program. If any step
-                // fails we fall back to the unmutated translation.
-                const uint8_t* translate_src = code;
-                uint32_t translate_len = len;
-                std::vector<uint8_t> mutated_bytes;
-                uint32_t used_mask = mask;
-                uint32_t mutation_count = 0;
-                if (region_mut && len >= 16) {
-                    std::vector<NativeInsn> stream;
-                    {
-                        Disassembler dis;
-                        uint32_t off3 = 0;
-                        while (off3 < len) {
-                            DisasmInsn insn;
-                            uint32_t ilen = dis.disassemble(code + off3, len - off3, insn);
-                            if (!ilen) break;
-                            NativeInsn ni;
-                            ni.bytes = insn.bytes;
-                            ni.rva = start + off3;
-                            ni.length = insn.length;
-                            ni.opcode = insn.opcode;
-                            ni.modrm = insn.modrm;
-                            ni.sib = insn.sib;
-                            ni.is_jcc = insn.category == InsnCategory::JCC;
-                            ni.is_call = insn.category == InsnCategory::CALL;
-                            ni.is_ret = insn.category == InsnCategory::RET;
-                            ni.is_push = insn.category == InsnCategory::PUSH;
-                            ni.is_pop = insn.category == InsnCategory::POP;
-                            ni.is_mov = insn.category == InsnCategory::MOV;
-                            ni.is_arith = insn.category == InsnCategory::ADD ||
-                                          insn.category == InsnCategory::SUB ||
-                                          insn.category == InsnCategory::MUL ||
-                                          insn.category == InsnCategory::IMUL;
-                            ni.is_logic = insn.category == InsnCategory::AND ||
-                                          insn.category == InsnCategory::OR ||
-                                          insn.category == InsnCategory::XOR ||
-                                          insn.category == InsnCategory::NOT;
-                            ni.is_shift = insn.category == InsnCategory::SHL ||
-                                          insn.category == InsnCategory::SHR ||
-                                          insn.category == InsnCategory::SAR;
-                            ni.is_test = insn.category == InsnCategory::TEST ||
-                                         insn.category == InsnCategory::CMP;
-                            stream.push_back(std::move(ni));
-                            off3 += ilen;
-                        }
-                    }
-                    // The VM only understands a small register-only subset, so
-                    // the VM mutation pass keeps substitutions only: garbage
-                    // injection and opaque predicates expand the stream with
-                    // encodings the translator cannot lower, which would make
-                    // every region fall back to the unmutated program.
-                    MutationEngine mutEngine;
-                    mutEngine.setStrength(static_cast<MutationStrength>(std::min<uint8_t>(region_mutation, 3)));
-                    mutEngine.setInjectGarbage(false);
-                    mutEngine.setReorder(false);
-                    std::vector<NativeInsn> mutated_stream;
-                    {
-                        Disassembler dchk;
-                        auto supported = [&](const NativeInsn& ni) -> bool {
-                            if (ni.bytes.empty()) return false;
-                            DisasmInsn di;
-                            if (!dchk.disassemble(ni.bytes.data(), ni.bytes.size(), di)) return false;
-                            using C = InsnCategory;
-                            switch (di.category) {
-                            case C::MOV: case C::LEA:
-                            case C::ADD: case C::SUB: case C::AND: case C::OR: case C::XOR:
-                            case C::CMP: case C::TEST:
-                            case C::INC: case C::DEC: case C::NEG: case C::NOT:
-                            case C::SHL: case C::SHR: case C::SAR:
-                            case C::NOP:
-                                return true;
-                            default:
-                                return false;
-                            }
-                        };
-                        for (const auto& insn : stream) {
-                            auto sub = mutEngine.mutate({insn});
-                            bool ok = !sub.empty() && !sub[0].bytes.empty() && sub[0].mutated;
-                            if (ok) {
-                                for (const auto& mi : sub) {
-                                    if (!supported(mi)) { ok = false; break; }
-                                }
-                            }
-                            if (ok) {
-                                mutated_stream.insert(mutated_stream.end(), sub.begin(), sub.end());
-                                mutation_count++;
-                            } else {
-                                mutated_stream.push_back(insn);
-                            }
-                        }
-                    }
-                    progress(57, std::string("Mutation: ") + std::to_string(mutation_count) +
-                            " substitutions accepted");
-
-                    if (mutation_count > 0) {
-                        for (const auto& mi : mutated_stream)
-                            mutated_bytes.insert(mutated_bytes.end(),
-                                                 mi.bytes.begin(), mi.bytes.end());
-                        // Recompute the register mask on the mutated stream:
-                        // the substitutions may touch registers the original
-                        // never mentioned, and the trampoline must preserve
-                        // every one of them.
-                        uint32_t new_mask = 0;
-                        bool new_bad = false;
-                        Disassembler dis2;
-                        uint32_t off4 = 0;
-                        while (off4 < mutated_bytes.size()) {
-                            DisasmInsn insn;
-                            uint32_t ilen = dis2.disassemble(mutated_bytes.data() + off4,
-                                                             mutated_bytes.size() - off4, insn);
-                            if (!ilen) { new_bad = true; break; }
-                            Operand ops[3] = { insn.dst, insn.src, insn.extra };
-                            for (int k = 0; k < 3; k++) {
-                                uint8_t rg = (uint8_t)ops[k].reg;
-                                if (rg <= 15) new_mask |= (1u << rg);
-                                if (ops[k].type == OperandType::Memory) {
-                                    uint8_t rb = (uint8_t)ops[k].base, ri = (uint8_t)ops[k].index;
-                                    if (rb <= 15) new_mask |= (1u << rb);
-                                    if (ri <= 15) new_mask |= (1u << ri);
-                                }
-                            }
-                            off4 += ilen;
-                        }
-                        if (!new_bad && off4 == mutated_bytes.size() &&
-                            !(new_mask & ((1u << 4) | (1u << 5))) && new_mask) {
-                            translate_src = mutated_bytes.data();
-                            translate_len = (uint32_t)mutated_bytes.size();
-                            used_mask = new_mask;
-                        } else {
-                            mutated_bytes.clear();
-                            mutation_count = 0;
-                        }
-                    }
-                }
-
-                VMLoweredBlock blk = VMTranslator::translate(translate_src, translate_len,
-                                                              pe.imageBase() + start,
-                                                              pe.imageBase(),
-                                                               region_complexity,
-                                                               region_mutation);
-                if (!blk.ok || blk.bytecode.empty()) {
-                    if (mutation_count > 0) {
-                        // The mutated stream did not lower cleanly; retry the
-                        // original code so the region keeps its protection.
-                        mutated_bytes.clear();
-                        used_mask = mask;
-                        blk = VMTranslator::translate(code, len,
-                                                       pe.imageBase() + start,
-                                                       pe.imageBase(),
-                                                        region_complexity,
-                                                        region_mutation);
-                        mutation_count = 0;
-                    }
-                    if (!blk.ok || blk.bytecode.empty()) {
-                        progress(57, std::string("VM skip region: ") + blk.skipReason);
-                        continue;
-                    }
-                }
-                mask = used_mask;
-
-                // ---- post-translation obfuscation --------------------------
-                // Dead-register junk emission + control-flow flattening.
-                // Derive the logical->physical opcode table from the reverse
-                // table so we can re-encode the obfuscated stream.
-                if (region_complexity > 0) {
-                    uint8_t mapping[256] = {0};
-                    for (int p = 0; p < 256; p++) {
-                        uint8_t logical = blk.reverse[(size_t)p];
-                        if (logical < WIRE_COUNT) mapping[logical] = (uint8_t)p;
-                    }
-                    blk.bytecode = vmObfuscate(blk.bytecode, blk.reverse.data(),
-                                                mapping, mask,
-                                                 region_complexity);
-                }
-
-                // Room for the runtime-generated trampoline (see np_vm_install).
-                uint32_t need = 51 + 10 * (uint32_t)__builtin_popcount(mask);
-                if (len < need + 16) {
-                    progress(57, "VM skip region: too small for trampoline");
-                    continue;
-                }
-                if (vm_regions.size() >= 32) break;
-
-                // Multi-layer encryption: the bytecode is stored encrypted
-                // and the runtime decrypts it at load time.
-                uint32_t nonce = (uint32_t)rng();
-                layeredEncrypt(blk.bytecode.data(), blk.bytecode.size(),
-                               nonce, start);
-
-                uint32_t bc_off = (uint32_t)data.size();
-                data.insert(data.end(), blk.bytecode.begin(), blk.bytecode.end());
-                while (data.size() & 7) data.push_back(0);
-                uint32_t rev_off = (uint32_t)data.size();
-                data.insert(data.end(), blk.reverse.begin(), blk.reverse.end());
-                while (data.size() & 7) data.push_back(0);
-
-                vm_regions.push_back({start, len, bc_off,
-                                      (uint32_t)blk.bytecode.size(), rev_off, mask, nonce});
-                if (result_) result_->vm_instructions += blk.insnsTranslated;
-                if (result_ && mutation_count > 0) result_->mutation_applied += mutation_count;
-                progress(58, std::string("VM translated ") + std::to_string(blk.insnsTranslated) +
-                        (mutation_count > 0 ? " instructions (mutated x" + std::to_string(mutation_count) + ")" : " instructions"));
+                vmLowerRegion(pe, data, vm_regions, rng, start, end_rva, selected, "marker");
             }
+        }
+
+        // ---- scanned functions (-func) -------------------------------------
+        // Each rule is a whole function body. Rules are applied in ascending
+        // RVA order so the payload layout is deterministic.
+        std::vector<const FunctionProtect*> scanned;
+        for (const auto& rule : config_.function_regions)
+            if (rule.source == FunctionSource::ScanFunction) scanned.push_back(&rule);
+        std::sort(scanned.begin(), scanned.end(),
+                  [](const FunctionProtect* a, const FunctionProtect* b) {
+                      return a->rva_start < b->rva_start;
+                  });
+        if (!scanned.empty()) {
+            progress(57, std::string("Function scanner: ") + std::to_string(scanned.size()) +
+                    " selected function(s)");
+            for (const auto* rule : scanned) {
+                if (rule->name == "skip") continue;
+                vmLowerRegion(pe, data, vm_regions, rng,
+                              rule->rva_start, rule->rva_end, rule, "func");
+            }
+        }
+    }
+    if (vm_regions.empty()) progress(57, "VM enabled but no region could be lowered");
 
             if (!vm_regions.empty()) {
                 uint32_t desc_off = (uint32_t)data.size();
@@ -1445,14 +1553,22 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
                 npPatch32(data, 20, desc_off);          // was: reserved
                 npPatch32(data, 88, (uint32_t)vm_regions.size());
             }
-        }
-    }
     // ---- assemble section -------------------------------------------------
     std::vector<uint8_t> prot_section;
     uint32_t code_size = kProtBlob64Size;
     while (code_size & 15) code_size++;
     prot_section.insert(prot_section.end(), kProtBlob64, kProtBlob64 + kProtBlob64Size);
     while (prot_section.size() < code_size) prot_section.push_back(0x90);
+
+    /* The runtime's writable statics (np_snap_buf, the registry probe
+     * buffer) are linked as .np_bss (NOLOAD) directly behind the blob
+     * image, so every PC-relative reference from the code points just
+     * past code_size. Deploy a zeroed window of the link-time size here
+     * and keep the section writable - without it those references read
+     * and write the blob's own code bytes. */
+    uint32_t bss_off = (uint32_t)prot_section.size();
+    for (uint32_t i = 0; i < kProtBlob64BssSize; i++) prot_section.push_back(0);
+    while (prot_section.size() & 7) prot_section.push_back(0);
 
     uint32_t data_off = (uint32_t)prot_section.size();
     prot_section.insert(prot_section.end(), data.begin(), data.end());
@@ -1463,11 +1579,12 @@ bool Packer::phase_buildProtection(PELib& pe, std::vector<uint8_t>& packed_data)
 
     int idx = pe.addSection(".np_prot",
                             (uint32_t)prot_section.size(),
-                            SEC_MEM_READ | SEC_MEM_EXECUTE | SEC_CODE);
+                            SEC_MEM_READ | SEC_MEM_WRITE | SEC_MEM_EXECUTE | SEC_CODE);
     pe.setSectionData(idx, prot_section);
     uint32_t base = pe.section(idx).VirtualAddress;
     prot_code_rva_   = base;
     prot_code_size_  = code_size;
+    prot_bss_rva_    = base + bss_off;
     prot_data_rva_   = base + data_off;
     prot_kernel_rva_ = kernel.empty() ? 0 : base + kernel_off;
 

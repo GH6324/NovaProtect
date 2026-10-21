@@ -13,6 +13,12 @@
  * Returns eax = 0 when every enabled check passed, otherwise the id of the
  * check that failed. Any non-zero value is treated as fatal by the caller.
  *
+ * Exception: the sandbox guard (bit9) and the interactive-desktop self-check
+ * (bit11) never return a failure id. They run first, and on a positive
+ * verdict they display "请在非沙箱内使用" and terminate the process cleanly
+ * through ExitProcess, so an analysis environment can neither run the
+ * payload nor obtain a crash dump.
+ *
  * Callee saved registers are preserved. Nothing is imported: modules and
  * exports are resolved through the PEB loader list.
  *
@@ -21,7 +27,9 @@
  *   +4   u32 version
  *   +8   u32 flags            bit0 anti-debug, bit1 anti-vm, bit2 timing,
  *                             bit3 dr, bit4 license, bit5 vm, bit6 integrity,
- *                             bit7 mutation, bit8 activation binding
+ *                             bit7 mutation, bit8 activation binding,
+ *                             bit9 sandbox guard, bit10 anti-dump,
+ *                             bit11 interactive-desktop self-check
  *   +12  u32 anti_debug_level
  *   +16  u32 anti_vm_level
  *   +20  u32 reserved
@@ -38,7 +46,15 @@
  *   +76  u32 integrity_count
  *   +80  u64 machine_bind_expected
  *   +88  u64 reserved2
- *   +96  payload area (8 byte aligned)
+ *   +96  u32 sandbox_score_threshold   block when np_sandbox_score >= value
+ *   +100 u32 env min_cpu_count
+ *   +104 u32 env min_ram_mb
+ *   +108 u32 env min_uptime_ms
+ *   +112 u32 env min_screen_width
+ *   +116 u32 env min_screen_height
+ *   +120 u32 env min_monitor_count
+ *   +124 u32 env_score_threshold      block when env score >= value
+ *   +128 payload area (8 byte aligned)
  * ========================================================================== */
 
 typedef unsigned char      u8;
@@ -85,7 +101,9 @@ typedef signed   long long i64;
 
 #define CTX_DR0 0x48
 #define CTX_SIZE 0x4D0
-#define CONTEXT_DEBUG_REGISTERS 0x00100000u
+/* x64: CONTEXT_AMD64 (0x00100000) | CONTEXT_DEBUG_REGISTERS (0x10).
+ * The AMD64 segment alone would leave Dr0-Dr7 untouched. */
+#define CONTEXT_DEBUG_REGISTERS 0x00100010u
 
 /* ---- strings ------------------------------------------------------------ */
 static const char np_s_ntdll[]    = "ntdll.dll";
@@ -97,11 +115,44 @@ static const char np_s_qsi[]      = "NtQuerySystemInformation";
 static const char np_s_user32[]   = "user32.dll";
 static const char np_s_gsm[]      = "GetSystemMetrics";
 static const char np_s_gtt[]      = "GetTickCount64";
+static const char np_s_advapi32[] = "advapi32.dll";
 
 /* ---- NT information classes ------------------------------------------- */
 #define NP_SIC_SYSTEM_BASIC_INFO     0u
 #define NP_SIC_SYSTEM_PROCESSOR_INFO 8u
 #define NP_SIC_SYSTEM_PROCESS_INFO   5u
+
+/* ---- sandbox score detail bits (also used by the debug log) ------------- */
+#define NP_SB_MOD       0x00000001u   /* known analysis / monitoring module   */
+#define NP_SB_INJECT    0x00000002u   /* module injected from a user path    */
+#define NP_SB_HYPER     0x00000004u   /* CPUID hypervisor vendor             */
+#define NP_SB_FIRMWARE  0x00000008u   /* firmware / disk artifacts           */
+#define NP_SB_CPU1      0x00000010u   /* single vCPU                         */
+#define NP_SB_CPU2      0x00000020u   /* two vCPUs                           */
+#define NP_SB_RAM2      0x00000040u   /* RAM below 2 GB                      */
+#define NP_SB_RAM4      0x00000080u   /* RAM below 4 GB                      */
+#define NP_SB_PROC40    0x00000100u   /* fewer than 40 processes             */
+#define NP_SB_PROC70    0x00000200u   /* fewer than 70 processes             */
+#define NP_SB_NOINPUT   0x00000400u   /* no input since boot (>= 3 min up)   */
+#define NP_SB_IDLE      0x00000800u   /* idle >= 30 min, uptime >= 45 min    */
+#define NP_SB_SLEEP     0x00001000u   /* RDTSC / wall-clock compression      */
+#define NP_SB_TSCSPREAD 0x00002000u   /* RDTSCP vs RDTSC spread              */
+#define NP_SB_COREMASK  0x00004000u   /* implausible APIC core mask          */
+#define NP_SB_RES1024   0x00008000u   /* screen narrower than 1024           */
+#define NP_SB_RES800    0x00010000u   /* screen narrower than 800            */
+#define NP_SB_NOMON     0x00020000u   /* zero monitors                       */
+#define NP_SB_TMPLNAME  0x00040000u   /* ephemeral account / computer name   */
+#define NP_SB_FRESH3    0x00080000u   /* Windows installed < 3 days ago      */
+#define NP_SB_FRESH14   0x00100000u   /* Windows installed < 14 days ago     */
+#define NP_SB_PARENT    0x00200000u   /* script-host / controller parent     */
+#define NP_SB_SVCHOST   0x00400000u   /* service-host parent                 */
+#define NP_SB_DBGHELP   0x00800000u   /* dbghelp-family module loaded        */
+
+/* A block additionally requires one strong corroborating signal so that a
+ * merely unusual-but-real machine (weak hardware, odd name, busy cmd) can
+ * never trip the guard on weak evidence alone. */
+#define NP_SB_STRONG (NP_SB_MOD | NP_SB_INJECT | NP_SB_HYPER | NP_SB_FIRMWARE | \
+                      NP_SB_SLEEP | NP_SB_NOINPUT | NP_SB_PARENT | NP_SB_IDLE)
 
 /* ========================================================================
  * minimal helpers
@@ -129,6 +180,8 @@ static void np_cpuid(u32 leaf, u32 subleaf, u32 out[4]) {
 
 static void* np_module_by_name(const char* name);
 static void* np_export_by_name(void* mod, const char* name);
+static u64   np_self_pid(void);
+static u64   np_parent_pid(void);
 
 static u64 np_volume_serial(void) {
     // Resolve GetVolumeInformationW and GetSystemDirectoryW through kernel32.
@@ -157,7 +210,7 @@ static u64 np_machine_guid_hash(void) {
     // It is derived from the machine's hardware identity and survives OS
     // reinstalls / disk swaps on the same motherboard, making it the primary
     // stability anchor for one-machine-one-license.
-    void* adv = np_module_by_name("advapi32.dll");
+    void* adv = np_module_by_name(np_s_advapi32);
     if (!adv) return 0;
     typedef u32 (__attribute__((ms_abi)) *np_rok_fn)(void*, const u16*, u32, u32, void**);
     np_rok_fn rok = (np_rok_fn)np_export_by_name(adv, "RegOpenKeyExW");
@@ -220,6 +273,12 @@ static u64 np_rdtscp(void) {
     u32 lo, hi, aux;
     __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
     (void)aux;
+    return ((u64)hi << 32) | lo;
+}
+
+static u64 np_rdtsc(void) {
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((u64)hi << 32) | lo;
 }
 
@@ -305,6 +364,564 @@ static void* np_export_by_name(void* mod, const char* name) {
 }
 
 /* ========================================================================
+ * small string helpers (ASCII vs UTF-16, case insensitive)
+ * ======================================================================== */
+
+static u16 np_lc16(u16 c) { return (c >= (u16)L'A' && c <= (u16)L'Z') ? (u16)(c + 32) : c; }
+static u8  np_lca (u8  c) { return (c >= 'A' && c <= 'Z') ? (u8)(c + 32) : c; }
+
+static u32 np_u16_len(const u16* s) {
+    u32 n = 0;
+    while (s && s[n]) n++;
+    return n;
+}
+
+/* does the wide string start with the ASCII prefix (case insensitive)? */
+static u32 np_u16_prefix_ci(const u16* s, u32 slen, const char* p) {
+    for (u32 i = 0; ; i++) {
+        if (p[i] == 0) return 1;
+        if (i >= slen) return 0;
+        if (np_lc16(s[i]) != (u16)np_lca((u8)p[i])) return 0;
+    }
+}
+
+/* does the wide string contain the ASCII needle (case insensitive)? */
+static u32 np_u16_has_ci(const u16* s, u32 slen, const char* needle) {
+    u32 nl = 0;
+    while (needle[nl]) nl++;
+    if (!nl || !s || nl > slen) return 0;
+    for (u32 i = 0; i + nl <= slen; i++) {
+        u32 ok = 1;
+        for (u32 j = 0; j < nl; j++) {
+            if (np_lc16(s[i + j]) != (u16)np_lca((u8)needle[j])) { ok = 0; break; }
+        }
+        if (ok) return 1;
+    }
+    return 0;
+}
+
+static u32 np_ascii_prefix_ci(const char* s, const char* p) {
+    for (u32 i = 0; ; i++) {
+        if (p[i] == 0) return 1;
+        if (s[i] == 0) return 0;
+        if (np_lca((u8)s[i]) != np_lca((u8)p[i])) return 0;
+    }
+}
+
+/* ========================================================================
+ * environment / registry probes used by the sandbox guard
+ * ======================================================================== */
+
+static void np_env_get(const char* name, char* out, u32 cap) {
+    if (!out || !cap) return;
+    out[0] = 0;
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (!k32) return;
+    typedef u32 (__attribute__((ms_abi)) *np_ge_fn)(const char*, char*, u32);
+    np_ge_fn ge = (np_ge_fn)np_export_by_name(k32, "GetEnvironmentVariableA");
+    if (!ge) return;
+    ge(name, out, cap);
+}
+
+typedef u32 (__attribute__((ms_abi)) *np_rok_fn)(void*, const u16*, u32, u32, void**);
+typedef u32 (__attribute__((ms_abi)) *np_rqv_fn)(void*, const u16*, void*, u32*, u8*, u32*);
+typedef u32 (__attribute__((ms_abi)) *np_rck_fn)(void*);
+
+static void* np_reg_open(u32 root, const u16* path) {
+    void* adv = np_module_by_name(np_s_advapi32);
+    if (!adv) return 0;
+    np_rok_fn rok = (np_rok_fn)np_export_by_name(adv, "RegOpenKeyExW");
+    if (!rok) return 0;
+    void* key = 0;
+    if (rok((void*)(u64)root, path, 0, 0x20019u, &key) != 0) return 0;
+    return key;
+}
+
+static void np_reg_close(void* key) {
+    if (!key) return;
+    void* adv = np_module_by_name(np_s_advapi32);
+    if (!adv) return;
+    np_rck_fn rck = (np_rck_fn)np_export_by_name(adv, "RegCloseKey");
+    if (rck) rck(key);
+}
+
+static u32 np_reg_dword(u32 root, const u16* path, const u16* name, u32* out) {
+    void* key = np_reg_open(root, path);
+    if (!key) return 0;
+    void* adv = np_module_by_name(np_s_advapi32);
+    np_rqv_fn rqv = adv ? (np_rqv_fn)np_export_by_name(adv, "RegQueryValueExW") : 0;
+    u32 v = 0, size = 4, type = 0, ok = 0;
+    if (rqv && rqv(key, name, 0, &type, (u8*)&v, &size) == 0 && type == 4u && size == 4) {
+        *out = v;
+        ok = 1;
+    }
+    np_reg_close(key);
+    return ok;
+}
+
+/* REG_MULTI_SZ containment probe: any embedded string containing needle. */
+static u32 np_reg_multisz_has(u32 root, const u16* path, const u16* name, const char* needle) {
+    void* key = np_reg_open(root, path);
+    if (!key) return 0;
+    void* adv = np_module_by_name(np_s_advapi32);
+    np_rqv_fn rqv = adv ? (np_rqv_fn)np_export_by_name(adv, "RegQueryValueExW") : 0;
+    static u16 buf[512];
+    u32 size = (u32)sizeof(buf), type = 0, hit = 0;
+    if (rqv && rqv(key, name, 0, &type, (u8*)buf, &size) == 0 &&
+        (type == 7u || type == 1u || type == 2u) && size >= 2) {
+        u32 start = 0;
+        for (u32 i = 0; i <= size / 2; i++) {
+            if (i == size / 2 || buf[i] == 0) {
+                if (i > start && np_u16_has_ci(buf + start, i - start, needle)) { hit = 1; break; }
+                start = i + 1;
+            }
+        }
+    }
+    np_reg_close(key);
+    return hit;
+}
+
+static u32 np_reg_exists(u32 root, const u16* path) {
+    void* key = np_reg_open(root, path);
+    if (!key) return 0;
+    np_reg_close(key);
+    return 1;
+}
+
+/* ---- process snapshot (NtQuerySystemInformation class 5) ---------------- */
+
+static void* np_snap_buf = 0;
+static u64   np_snap_len = 0;
+
+static void np_snap_free(void) {
+    if (!np_snap_buf) return;
+    void* ntdll = np_module_by_name(np_s_ntdll);
+    if (ntdll) {
+        typedef i32 (__attribute__((ms_abi)) *np_ntfree_fn)(void*, void**, u64*, u32);
+        np_ntfree_fn fr = (np_ntfree_fn)np_export_by_name(ntdll, "NtFreeVirtualMemory");
+        if (fr) {
+            void* b = np_snap_buf;
+            u64 s = 0;
+            fr((void*)-1, &b, &s, 0x8000u);   /* MEM_RELEASE */
+        }
+    }
+    np_snap_buf = 0;
+    np_snap_len = 0;
+}
+
+static u32 np_snapshot_processes(void) {
+    if (np_snap_buf) return 1;
+    void* ntdll = np_module_by_name(np_s_ntdll);
+    if (!ntdll) return 0;
+    typedef i32 (__attribute__((ms_abi)) *np_ntavm_fn)(void*, void**, u64, u64*, u32, u32);
+    np_ntavm_fn avm = (np_ntavm_fn)np_export_by_name(ntdll, "NtAllocateVirtualMemory");
+    typedef i32 (__attribute__((ms_abi)) *np_qsi_fn)(u32 cls, void* buf, u32 len, u32* ret);
+    np_qsi_fn qsi = (np_qsi_fn)np_export_by_name(ntdll, np_s_qsi);
+    if (!avm || !qsi) return 0;
+
+    u64 size = 0x200000u;              /* 2 MB: ~2000 process entries */
+    void* base = 0;
+    if (avm((void*)-1, &base, 0, &size, 0x3000u, 0x04u) < 0 || !base) return 0;
+    u32 ret = 0;
+    if (qsi(NP_SIC_SYSTEM_PROCESS_INFO, base, (u32)size, &ret) < 0) {
+        np_snap_buf = base;            /* let np_snap_free release it */
+        np_snap_len = size;
+        np_snap_free();
+        return 0;
+    }
+    np_snap_buf = base;
+    np_snap_len = size;
+    return 1;
+}
+
+static u32 np_snap_count(void) {
+    if (!np_snap_buf) return 0;
+    /* our own sample process is not part of the environment population */
+    u64 self = np_self_pid();
+    u32 n = 0;
+    u8* p = (u8*)np_snap_buf;
+    for (;;) {
+        if (!self || np_rd64(p + 0x50) != self) n++;
+        u32 next = np_rd32(p);
+        if (!next) break;
+        p += next;
+    }
+    return n;
+}
+
+/* copy the ImageName of the process with the given pid into out (wide).
+ * SYSTEM_PROCESS_INFORMATION (x64): UniqueProcessId at +0x50, ImageName
+ * (UNICODE_STRING) at +0x38 (Length +0x38, Buffer +0x40). */
+static u32 np_snap_name_of(u64 pid, u16* out, u32 cap) {
+    if (!np_snap_buf || !out || cap < 2) return 0;
+    u8* p = (u8*)np_snap_buf;
+    for (;;) {
+        if (np_rd64(p + 0x50) == pid) {           /* UniqueProcessId */
+            u16 len = *(u16*)(p + 0x38);          /* ImageName.Length */
+            u16* src = *(u16**)(p + 0x40);        /* ImageName.Buffer  */
+            if (src && len) {
+                u32 chars = (u32)len / 2;
+                if (chars > cap - 1) chars = cap - 1;
+                for (u32 i = 0; i < chars; i++) out[i] = src[i];
+                out[chars] = 0;
+                return chars;
+            }
+            return 0;
+        }
+        u32 next = np_rd32(p);
+        if (!next) break;
+        p += next;
+    }
+    return 0;
+}
+
+/* PROCESS_BASIC_INFORMATION: self pid at +0x20, parent pid at +0x28. */
+static u64 np_pid_field(u32 off) {
+    void* ntdll = np_module_by_name(np_s_ntdll);
+    if (!ntdll) return 0;
+    typedef i32 (__attribute__((ms_abi)) *np_ntqip_fn)(void*, u32, void*, u32, u32*);
+    np_ntqip_fn fn = (np_ntqip_fn)np_export_by_name(ntdll, np_s_qip);
+    if (!fn) return 0;
+    u8 pbi[0x30];
+    np_memset(pbi, 0, sizeof(pbi));
+    u32 ret = 0;
+    if (fn((void*)-1, 0u, pbi, (u32)sizeof(pbi), &ret) < 0) return 0;
+    return np_rd64(pbi + off);
+}
+
+static u64 np_self_pid(void)   { return np_pid_field(0x20); }
+static u64 np_parent_pid(void) { return np_pid_field(0x28); }
+
+/* ---- user activity ------------------------------------------------------ */
+
+/* Milliseconds since the last session-wide input event; 0xFFFFFFFF when the
+ * API is unavailable (e.g. session 0). */
+static u32 np_input_idle_ms(u64 now_ms) {
+    void* u32mod = np_module_by_name(np_s_user32);
+    if (!u32mod) return 0xFFFFFFFFu;
+    typedef int (__attribute__((ms_abi)) *np_glii_fn)(void*);
+    np_glii_fn glii = (np_glii_fn)np_export_by_name(u32mod, "GetLastInputInfo");
+    if (!glii) return 0xFFFFFFFFu;
+    u8 lii[8];
+    np_memset(lii, 0, sizeof(lii));
+    *(u32*)lii = 8u;                       /* cbSize */
+    if (!glii(lii)) return 0xFFFFFFFFu;
+    u32 last = np_rd32(lii + 4);           /* dwTime (GetTickCount domain) */
+    return (u32)now_ms - last;             /* wrap-safe unsigned delta */
+}
+
+static int np_taskbar_present(void) {
+    void* u32mod = np_module_by_name(np_s_user32);
+    if (!u32mod) return 0;
+    typedef void* (__attribute__((ms_abi)) *np_fw_fn)(const u16*, const u16*);
+    np_fw_fn fw = (np_fw_fn)np_export_by_name(u32mod, "FindWindowW");
+    if (!fw) return 0;
+    static const u16 cls[] = { 'S','h','e','l','l','_','T','r','a','y','W','n','d',0 };
+    return fw(cls, 0) != 0;
+}
+
+/* ---- Windows install age ------------------------------------------------- */
+
+static u32 np_install_age_days(void) {
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (!k32) return 0xFFFFFFFFu;
+    typedef void (__attribute__((ms_abi)) *np_gstaft_fn)(u64*);
+    np_gstaft_fn gstaft = (np_gstaft_fn)np_export_by_name(k32, "GetSystemTimeAsFileTime");
+    if (!gstaft) return 0xFFFFFFFFu;
+    u64 ft = 0;
+    gstaft(&ft);
+    u64 now_unix = ft / 10000000ull - 11644473600ull;
+
+    static const u16 path[] = {
+        'S','O','F','T','W','A','R','E','\\','M','i','c','r','o','s','o','f','t','\\',
+        'W','i','n','d','o','w','s',' ','N','T','\\','C','u','r','r','e','n','t','V','e','r','s','i','o','n',0 };
+    static const u16 name[] = { 'I','n','s','t','a','l','l','D','a','t','e',0 };
+    u32 install = 0;
+    if (!np_reg_dword(0x80000002u, path, name, &install)) return 0xFFFFFFFFu;
+    if (!install || (u64)install > now_unix) return 0xFFFFFFFFu;
+    return (u32)((now_unix - (u64)install) / 86400ull);
+}
+
+/* ---- firmware / virtual disk artifacts ----------------------------------- */
+
+static u32 np_firmware_artifacts(void) {
+    static const u16 diskEnum[] = {
+        'S','Y','S','T','E','M','\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t','\\',
+        'S','e','r','v','i','c','e','s','\\','D','i','s','k','\\','E','n','u','m',0 };
+    static const u16 empty[] = { 0 };
+    if (np_reg_multisz_has(0x80000002u, diskEnum, empty, "vmware")) return 1;
+    if (np_reg_multisz_has(0x80000002u, diskEnum, empty, "vbox"))    return 1;
+    if (np_reg_multisz_has(0x80000002u, diskEnum, empty, "qemu"))    return 1;
+    if (np_reg_multisz_has(0x80000002u, diskEnum, empty, "xen"))     return 1;
+    if (np_reg_multisz_has(0x80000002u, diskEnum, empty, "virtual")) return 1;
+
+    static const u16 vboxKey[]  = { 'S','O','F','T','W','A','R','E','\\','O','r','a','c','l','e','\\','V','i','r','t','u','a','l','B','o','x',0 };
+    static const u16 vmwKey[]   = { 'S','O','F','T','W','A','R','E','\\','V','M','w','a','r','e',',',' ','I','n','c','.','\\','V','M','w','a','r','e',0 };
+    static const u16 vboxDsdt[] = { 'H','A','R','D','W','A','R','E','\\','A','C','P','I','\\','D','S','D','T','\\','V','B','O','X','_','_',0 };
+    if (np_reg_exists(0x80000002u, vboxKey))  return 1;
+    if (np_reg_exists(0x80000002u, vmwKey))   return 1;
+    if (np_reg_exists(0x80000002u, vboxDsdt)) return 1;
+    return 0;
+}
+
+/* ---- injected module detection ------------------------------------------- */
+
+/* A module that lives in a user-writable location (Temp, AppData, Public,
+ * ProgramData, Downloads) is almost always an injected analysis agent: no
+ * legitimate system or application DLL is ever loaded from there. The
+ * application's own directory and the Windows directories are allowed, so
+ * portable apps and plugin layouts never trip this. */
+static u32 np_injected_module_paths(void) {
+    u8* peb = np_peb();
+    if (!peb) return 0;
+    u8* ldr = *(u8**)(peb + PEB_LDR);
+    if (!ldr) return 0;
+    u8* head = ldr + LDR_IN_LOAD_ORDER;
+    u8* cur  = *(u8**)head;
+    u8* first = cur;
+
+    u16 sysdir[264];
+    np_memset(sysdir, 0, sizeof(sysdir));
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (k32) {
+        typedef u32 (__attribute__((ms_abi)) *np_gsd_fn)(void*, u32);
+        np_gsd_fn gsd = (np_gsd_fn)np_export_by_name(k32, "GetSystemDirectoryW");
+        if (gsd) gsd(sysdir, 260);
+    }
+    u32 syslen = np_u16_len(sysdir);
+
+    /* allow prefix = directory of the first in-load-order image (the EXE) */
+    u16 appdir[264];
+    np_memset(appdir, 0, sizeof(appdir));
+    if (first) {
+        u16 flen = *(u16*)(first + LDR_ENTRY_FULLNAME);
+        u16* fbuf = *(u16**)(first + LDR_ENTRY_FULLNAME + 8);
+        u32 chars = (u32)flen / 2;
+        if (fbuf && chars && chars < 260) {
+            u32 slash = 0;
+            for (u32 i = 0; i < chars; i++) {
+                appdir[i] = fbuf[i];
+                if (fbuf[i] == (u16)L'\\') slash = i;
+            }
+            appdir[slash ? slash + 1 : 0] = 0;   /* keep trailing backslash */
+        }
+    }
+    u32 applen = np_u16_len(appdir);
+
+    while (cur != head) {
+        u16 flen = *(u16*)(cur + LDR_ENTRY_FULLNAME);
+        u16* fbuf = *(u16**)(cur + LDR_ENTRY_FULLNAME + 8);
+        u32 chars = (u32)flen / 2;
+        if (fbuf && chars) {
+            u32 allowed = 0;
+            if (syslen) {
+                /* compare against the system directory as a wide prefix */
+                u32 i = 0;
+                for (; i < syslen && i < chars; i++) {
+                    if (np_lc16(fbuf[i]) != np_lc16(sysdir[i])) break;
+                }
+                if (i == syslen && chars > syslen && fbuf[syslen] == (u16)L'\\') allowed = 1;
+            }
+            if (!allowed && applen && chars >= applen) {
+                u32 i = 0;
+                for (; i < applen; i++) {
+                    if (np_lc16(fbuf[i]) != np_lc16(appdir[i])) break;
+                }
+                if (i == applen) allowed = 1;
+            }
+            if (!allowed &&
+                (np_u16_has_ci(fbuf, chars, "\\windows\\syswow64\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\windows\\assembly\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\windows\\microsoft.net\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\windows\\winsxs\\"))) allowed = 1;
+
+            if (!allowed &&
+                (np_u16_has_ci(fbuf, chars, "\\temp\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\appdata\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\users\\public\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\programdata\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\downloads\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\$recycle.bin\\") ||
+                 np_u16_has_ci(fbuf, chars, "\\perflogs\\"))) {
+                return 1;
+            }
+        }
+        cur = *(u8**)cur;
+    }
+    return 0;
+}
+
+/* ---- ephemeral account / computer names ---------------------------------- */
+
+/* Fixed-width char matrix, NOT a const char* array: the blob is deployed at
+ * an arbitrary load base, so any link-time absolute pointer embedded in the
+ * data section would dangle (see the tripwire in build.ps1). Matrix rows are
+ * reached with a RIP-relative lea plus a row stride, like every other string
+ * in the runtime. GCC rejects an over-long initializer, so the width is
+ * compile-time checked. */
+static u32 np_template_name(void) {
+    static const char kTemplates[12][8] = {
+        "win", "admin", "user", "pc-", "test", "sandbox", "virus",
+        "malware", "analy", "cuckoo", "joe", "sample"
+    };
+    char host[160], user[160];
+    np_env_get("COMPUTERNAME", host, sizeof(host));
+    np_env_get("USERNAME", user, sizeof(user));
+    const char* cands[2];
+    cands[0] = host; cands[1] = user;
+    for (u32 c = 0; c < 2; c++) {
+        if (!cands[c][0]) continue;
+        for (u32 t = 0; t < sizeof(kTemplates) / sizeof(kTemplates[0]); t++) {
+            if (np_ascii_prefix_ci(cands[c], kTemplates[t])) return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- sleep / wall-clock compression -------------------------------------- */
+
+/* A sandbox that accelerates wall-clock time (or fakes RDTSC) makes the
+ * cycles-per-millisecond ratio across a real Sleep implausible for any
+ * physical CPU. The band 0.25 - 40 GHz covers every shipping x86 part. */
+static u32 np_sleep_compressed(void) {
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (!k32) return 0;
+    typedef u64   (__attribute__((ms_abi)) *np_gtt_fn)(void);
+    typedef void  (__attribute__((ms_abi)) *np_sleep_fn)(u32);
+    np_gtt_fn  gtt = (np_gtt_fn) np_export_by_name(k32, np_s_gtt);
+    np_sleep_fn sl = (np_sleep_fn)np_export_by_name(k32, "Sleep");
+    if (!gtt || !sl) return 0;
+
+    u64 ratios[3];
+    u32 n = 0;
+    for (u32 i = 0; i < 3; i++) {
+        u64 w0 = gtt();
+        u64 c0 = np_rdtsc();
+        sl(50);
+        u64 c1 = np_rdtsc();
+        u64 w1 = gtt();
+        u64 wms = w1 >= w0 ? w1 - w0 : 0;
+        u64 cyc = c1 >= c0 ? c1 - c0 : 0;
+        if (wms) ratios[n++] = cyc / wms;
+    }
+    if (!n) return 0;
+    /* median of up to three samples */
+    for (u32 i = 0; i + 1 < n; i++) {
+        for (u32 j = i + 1; j < n; j++) {
+            if (ratios[j] < ratios[i]) { u64 t = ratios[i]; ratios[i] = ratios[j]; ratios[j] = t; }
+        }
+    }
+    u64 med = ratios[n / 2];
+    return (med < 250000ull || med > 40000000ull) ? 1u : 0u;
+}
+
+/* ---- debug logging (opt-in via NOVAPROTECT_SANDBOX_DEBUG=1) --------------- */
+
+static u32 np_dbg_enabled(void) {
+    char v[8];
+    np_env_get("NOVAPROTECT_SANDBOX_DEBUG", v, sizeof(v));
+    return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
+static void np_dbg_line(const char* s) {
+    if (!s) return;
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (!k32) return;
+    typedef void* (__attribute__((ms_abi)) *np_cf_fn)(const char*, u32, u32, void*, u32, u32, void*);
+    typedef u32   (__attribute__((ms_abi)) *np_wf_fn)(void*, const void*, u32, u32*, void*);
+    typedef u32   (__attribute__((ms_abi)) *np_sh_fn)(void*);
+    typedef int   (__attribute__((ms_abi)) *np_sfp_fn)(void*, i32, i32*, u32);
+    np_cf_fn  cf = (np_cf_fn) np_export_by_name(k32, "CreateFileA");
+    np_wf_fn  wf = (np_wf_fn) np_export_by_name(k32, "WriteFile");
+    np_sh_fn  ch = (np_sh_fn) np_export_by_name(k32, "CloseHandle");
+    np_sfp_fn sfp = (np_sfp_fn)np_export_by_name(k32, "SetFilePointer");
+    if (!cf || !wf || !ch) return;
+
+    char tmp[300];
+    np_env_get("TEMP", tmp, 200);
+    u32 n = 0;
+    while (tmp[n]) n++;
+    static const char suffix[] = "\\novaprotect-sandbox.log";
+    for (u32 i = 0; suffix[i] && n + 1 < sizeof(tmp); i++) tmp[n++] = suffix[i];
+    tmp[n] = 0;
+
+    void* h = cf(tmp, 0x40000000u, 3u, 0, 4u, 0x80u, 0);   /* GENERIC_WRITE, OPEN_ALWAYS */
+    if (!h || h == (void*)-1) return;
+    if (sfp) sfp(h, 0, 0, 2u);                              /* FILE_END */
+    u32 len = 0;
+    while (s[len] && len < 240) len++;
+    u32 written = 0;
+    wf(h, s, len, &written, 0);
+    ch(h);
+}
+
+static void np_dbg_hex32(char* p, u32 v) {
+    static const char hx[] = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; i--) p[7 - i] = hx[(v >> (i * 4)) & 0xF];
+}
+
+static void np_dbg_report(u32 score, u32 detail, u32 threshold) {
+    if (!np_dbg_enabled()) return;
+    char line[256];
+    u32 n = 0;
+    static const char hdr[] = "NP-SANDBOX score=";
+    for (u32 i = 0; hdr[i]; i++) line[n++] = hdr[i];
+    /* decimal score */
+    char dec[12];
+    int d = 0;
+    if (!score) dec[d++] = '0';
+    while (score) { dec[d++] = (char)('0' + (score % 10)); score /= 10; }
+    while (d--) line[n++] = dec[d];
+    static const char sep[] = " threshold=";
+    for (u32 i = 0; sep[i]; i++) line[n++] = sep[i];
+    u32 t = threshold;
+    d = 0;
+    if (!t) dec[d++] = '0';
+    while (t) { dec[d++] = (char)('0' + (t % 10)); t /= 10; }
+    while (d--) line[n++] = dec[d];
+    static const char dtag[] = " detail=0x";
+    for (u32 i = 0; dtag[i]; i++) line[n++] = dtag[i];
+    np_dbg_hex32(line + n, detail);
+    n += 8;
+    line[n++] = '\n';
+    line[n] = 0;
+    np_dbg_line(line);
+
+    /* Same rule as kTemplates: inline char matrix, no absolute pointers.
+     * Width 24 covers the longest tag ("+12 no-input-since-boot", 23) and
+     * GCC rejects anything longer at compile time. */
+    static const struct { u32 bit; char tag[24]; } kTags[] = {
+        { NP_SB_MOD,       "+25 analysis-module"      },
+        { NP_SB_INJECT,    "+25 injected-module"      },
+        { NP_SB_HYPER,     "+8  hypervisor-vendor"    },
+        { NP_SB_FIRMWARE,  "+8  firmware-artifacts"   },
+        { NP_SB_CPU1,      "+12 single-vcpu"          },
+        { NP_SB_CPU2,      "+4  two-vcpu"             },
+        { NP_SB_RAM2,      "+12 ram-under-2gb"        },
+        { NP_SB_RAM4,      "+6  ram-under-4gb"        },
+        { NP_SB_PROC40,    "+8  procs-under-40"       },
+        { NP_SB_PROC70,    "+4  procs-under-70"       },
+        { NP_SB_NOINPUT,   "+12 no-input-since-boot"  },
+        { NP_SB_IDLE,      "+8  idle-30min"           },
+        { NP_SB_SLEEP,     "+15 sleep-compression"    },
+        { NP_SB_TSCSPREAD, "+5  rdtscp-spread"        },
+        { NP_SB_COREMASK,  "+3  core-mask-anomaly"    },
+        { NP_SB_RES1024,   "+6  screen-under-1024"    },
+        { NP_SB_RES800,    "+8  screen-under-800"     },
+        { NP_SB_NOMON,     "+4  zero-monitors"        },
+        { NP_SB_TMPLNAME,  "+6  template-name"        },
+        { NP_SB_FRESH3,    "+10 install-under-3d"     },
+        { NP_SB_FRESH14,   "+6  install-under-14d"    },
+        { NP_SB_PARENT,    "+10 script-host-parent"   },
+        { NP_SB_SVCHOST,   "+4  svchost-parent"       },
+        { NP_SB_DBGHELP,   "+6  dbghelp-module"       },
+    };
+    for (u32 i = 0; i < sizeof(kTags) / sizeof(kTags[0]); i++) {
+        if (detail & kTags[i].bit) np_dbg_line(kTags[i].tag);
+    }
+}
+
+/* ========================================================================
  * individual checks - every one returns 0 on pass, non zero on detection
  * ======================================================================== */
 
@@ -376,12 +993,6 @@ static u32 np_chk_dr(void* getctx) {
     return 0;
 }
 
-static u64 np_rdtsc(void) {
-    u32 lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((u64)hi << 32) | lo;
-}
-
 /* Single step detection: an external debugger that traps every instruction
  * makes the measured delta explode. The threshold is calibrated at pack time
  * so genuine CPUs and clock-speed variation never trip it. */
@@ -417,9 +1028,10 @@ static u32 np_chk_cpuid(void) {
     /* "prl hyperv  " */
     if (ebx == 0x206C7270u && ecx == 0x65707968u && edx == 0x20207672u) return 1;
     /* "bhyve bhyve " */
-    if (ebx == 0x76796862u && ecx == 0x68622065u && edx == 0x20657679u) return 1;
+    if (ebx == 0x76796362u && ecx == 0x68622065u && edx == 0x20657679u) return 1;
     return 0;
 }
+
 /* ========================================================================
  * mutation kernel verification
  *
@@ -756,48 +1368,69 @@ static u32 np_chk_integrity(void* base, const u8* b) {
 }
 
 /* ========================================================================
- * sandbox / analysis-tool detection
+ * known analysis / sandbox modules in the loader list
  *
- * Themida's strongest mode walks the PEB loader list looking for known
- * sandbox DLLs. This is cheap (no API calls), reliable, and avoids the
- * false-positive risk of registry or file probes.
+ * Cheap (no API calls) and reliable: an instrumented host injects its agent
+ * DLLs, and every one of them shows up in the PEB loader list.
  * ======================================================================== */
 
 static const char np_s_badmods[] =
     "SandboxieDll\0" "SBIEDLL\0" "api_log\0"
     "vmcheck\0" "wpesype\0" "dirwatch\0"
     "dbghelp\0" "dbgcore\0" "dbgeng\0" "dbgmodel\0"
-    "procmon\0" "processhacker\0" "frida\0"
+    "procmon\0" "procmon64\0" "processhacker\0" "frida\0"
     "wxwork\0" "wpscloudsvr\0" "salamand\0"
-    "lilith\0" "sandbox\0" "xworm\0" "antivm\0";
+    "lilith\0" "sandbox\0" "xworm\0" "antivm\0"
+    "x64dbg\0" "x32dbg\0" "windbg\0" "ollydbg\0"
+    "cheatengine\0" "syser\0" "apimonitor\0" "wireshark\0"
+    "dumpcap\0" "tcpview\0" "procexp\0" "ksdebug\0"
+    "cuckoo\0" "joebox\0";
 
 static u32 np_chk_bad_modules(void) {
     u8* peb = np_peb();
     if (!peb) return 0;
     u8* ldr = *(u8**)(peb + PEB_LDR);
     if (!ldr) return 0;
+    /* the protected image itself is never evidence: an application whose own
+     * name happens to start with "sandbox" / "test" / ... must not trip here */
+    void* self_img = *(void**)(peb + 0x10);   /* ImageBaseAddress */
     u8* head = ldr + LDR_IN_LOAD_ORDER;
     u8* cur  = *(u8**)head;
     while (cur != head) {
-        u16 len = *(u16*)(cur + LDR_ENTRY_BASENAME);
-        u16* nm = *(u16**)(cur + LDR_ENTRY_BASENAME + 8);
-        if (nm && len) {
-            len >>= 1;
-            for (const char* bl = np_s_badmods; *bl; ) {
-                u32 blen = 0;
-                while (bl[blen]) blen++;
-                if ((u32)blen <= (u32)len) {
-                    u32 match = 1;
-                    for (u32 j = 0; j < blen; j++) {
-                        u16 a = nm[j];
-                        u8  b = (u8)bl[j];
-                        if (a >= 'A' && a <= 'Z') a += 32;
-                        if (b >= 'A' && b <= 'Z') b += 32;
-                        if (a != b) { match = 0; break; }
-                    }
-                    if (match) return 1;
+        if (*(void**)(cur + LDR_ENTRY_DLLBASE) != self_img) {
+            u16 len = *(u16*)(cur + LDR_ENTRY_BASENAME);
+            u16* nm = *(u16**)(cur + LDR_ENTRY_BASENAME + 8);
+            if (nm && len) {
+                len >>= 1;
+                for (const char* bl = np_s_badmods; *bl; ) {
+                    u32 blen = 0;
+                    while (bl[blen]) blen++;
+                    if ((u32)blen <= (u32)len && np_u16_prefix_ci(nm, len, bl)) return 1;
+                    bl += blen + 1;
                 }
-                bl += blen + 1;
+            }
+        }
+        cur = *(u8**)cur;
+    }
+    return 0;
+}
+
+/* any loaded module (other than the protected image itself) whose basename
+ * starts with "dbg" (dbghelp family). */
+static u32 np_dbghelp_family(void) {
+    u8* peb = np_peb();
+    if (!peb) return 0;
+    u8* ldr = *(u8**)(peb + PEB_LDR);
+    if (!ldr) return 0;
+    void* self_img = *(void**)(peb + 0x10);   /* ImageBaseAddress */
+    u8* head = ldr + LDR_IN_LOAD_ORDER;
+    u8* cur  = *(u8**)head;
+    while (cur != head) {
+        if (*(void**)(cur + LDR_ENTRY_DLLBASE) != self_img) {
+            u16 len = *(u16*)(cur + LDR_ENTRY_BASENAME);
+            u16* nm = *(u16**)(cur + LDR_ENTRY_BASENAME + 8);
+            if (nm && (len >> 1) >= 7) {
+                if (np_lc16(nm[0]) == 'd' && np_lc16(nm[1]) == 'b' && np_lc16(nm[2]) == 'g') return 1;
             }
         }
         cur = *(u8**)cur;
@@ -806,150 +1439,199 @@ static u32 np_chk_bad_modules(void) {
 }
 
 /* ========================================================================
- * sandbox / analysis-tool scoring (v2 flag bit 9)
+ * sandbox / analysis-environment scoring (v2 flag bit 9)
  *
- * Each cheap observable contributes a weighted bit. A cumulative score at or
- * above the pack-time threshold trips NP_CHK_SANDBOX. The weights are tuned
- * so a physical desktop stays far below the default threshold while微步 and
- * other online-analysis VMs / instrumented hosts cross it.
+ * Weighted, corroboration-aware detection tuned for online-analysis hosts
+ * (微步云沙箱 and peers) that inject an agent DLL, run 1-2 vCPUs with a few
+ * GB of RAM on a freshly imaged guest, launch the sample from a controller
+ * process and never provide user input.
+ *
+ * Design rules that keep real machines clean:
+ *   - Hyper-V is exempt (VBS on physical Windows 11 reports it).
+ *   - Ephemeral account/computer names, install age and idle signals only
+ *     count while no human input was seen recently.
+ *   - Install age additionally requires a headless, weak-hardware profile.
+ *   - A block requires the threshold AND one strong corroborating signal,
+ *     so odd-but-real machines never trip on weak evidence alone.
  * ======================================================================== */
 
-static u32 np_sandbox_score(void) {
+static void np_dbg_stage(u32 n) {
+    if (!np_dbg_enabled()) return;
+    char line[24];
+    static const char pfx[] = "stage ";
+    u32 i = 0;
+    for (; pfx[i]; i++) line[i] = pfx[i];
+    char dec[12];
+    int d = 0;
+    if (!n) dec[d++] = '0';
+    while (n) { dec[d++] = (char)('0' + n % 10); n /= 10; }
+    while (d--) line[i++] = dec[d];
+    line[i++] = '\n';
+    line[i] = 0;
+    np_dbg_line(line);
+}
+
+static u32 np_sandbox_score_ex(u32* detail) {
     u32 score = 0;
+    u32 det = 0;
 
     /* 1. hypervisor vendor bits via CPUID 0x40000000 (Hyper-V exempt) */
     u32 c[4] = {0};
     np_cpuid_leaf(0x40000000u, 0, c);
     if (c[0]) {
-        if (c[1] == 0x61774D56u && c[2] == 0x4D567265u && c[3] == 0x65726177u) score += 8;   /* VMware */
-        else if (c[1] == 0x4B4D564Bu && c[2] == 0x564B4D56u && c[3] == 0x0000004Du) score += 8; /* KVM */
-        else if (c[1] == 0x566E6558u && c[2] == 0x65584D4Du && c[3] == 0x4D4D566Eu) score += 8; /* Xen */
-        else if (c[1] == 0x786F4256u) score += 8;   /* VirtualBox */
-        else if (c[1] == 0x206C7270u) score += 8;   /* Parallels */
+        if (c[1] == 0x61774D56u && c[2] == 0x4D567265u && c[3] == 0x65726177u) { score += 8; det |= NP_SB_HYPER; }   /* VMware */
+        else if (c[1] == 0x4B4D564Bu && c[2] == 0x564B4D56u && c[3] == 0x0000004Du) { score += 8; det |= NP_SB_HYPER; } /* KVM */
+        else if (c[1] == 0x566E6558u && c[2] == 0x65584D4Du && c[3] == 0x4D4D566Eu) { score += 8; det |= NP_SB_HYPER; } /* Xen */
+        else if (c[1] == 0x786F4256u) { score += 8; det |= NP_SB_HYPER; }   /* VirtualBox */
+        else if (c[1] == 0x206C7270u) { score += 8; det |= NP_SB_HYPER; }   /* Parallels */
     }
 
-    /* 2. physical CPU count through NtQuerySystemInformation */
+    /* 2. CPU count + physical RAM through NtQuerySystemInformation */
+    u32 cpu = 0;
+    u64 ram_bytes = 0;
     void* ntdll = np_module_by_name(np_s_ntdll);
     if (ntdll) {
         typedef i32 (__attribute__((ms_abi)) *np_qsi_fn)(u32 cls, void* buf, u32 len, u32* ret);
         np_qsi_fn qsi = (np_qsi_fn)np_export_by_name(ntdll, np_s_qsi);
         if (qsi) {
-            u8 basic[64]; np_memset(basic, 0, sizeof(basic));
+            u8 basic[64];
+            np_memset(basic, 0, sizeof(basic));
             u32 ret = 0;
             if (qsi(NP_SIC_SYSTEM_BASIC_INFO, basic, sizeof(basic), &ret) >= 0) {
-                u8 count = basic[0];
-                if (count < 2) score += 14;
-                else if (count < 4) score += 4;
+                cpu = basic[0];
+                u64 pages = np_rd64(basic + 24);        /* NumberOfPhysicalPages */
+                u32 page_size = np_rd32(basic + 32);    /* PageSize */
+                ram_bytes = pages * (u64)page_size;
             }
         }
     }
+    if (cpu == 1) { score += 12; det |= NP_SB_CPU1; }
+    else if (cpu == 2) { score += 4; det |= NP_SB_CPU2; }
+    if (ram_bytes && ram_bytes < (2ull << 30)) { score += 12; det |= NP_SB_RAM2; }
+    else if (ram_bytes && ram_bytes < (4ull << 30)) { score += 6; det |= NP_SB_RAM4; }
+    np_dbg_stage(2);
 
-    /* 3. extremely small RAM is characteristic of online-analysis sandboxes */
-    if (ntdll) {
-        typedef i32 (__attribute__((ms_abi)) *np_qsi_fn)(u32 cls, void* buf, u32 len, u32* ret);
-        np_qsi_fn qsi = (np_qsi_fn)np_export_by_name(ntdll, np_s_qsi);
-        if (qsi) {
-            u8 basic[64]; np_memset(basic, 0, sizeof(basic));
-            u32 ret = 0;
-            if (qsi(NP_SIC_SYSTEM_BASIC_INFO, basic, sizeof(basic), &ret) >= 0) {
-                u64 pages = *(u64*)(basic + 24);   /* NumberOfPhysicalPages */
-                u64 pageSize = *(u32*)(basic + 32);
-                if (pages && pageSize && pages * pageSize < (4ull << 30)) score += 10;
-            }
-        }
-    }
+    /* 3. process population + parent process identity */
+    if (np_snapshot_processes()) {
+        u32 procs = np_snap_count();
+        if (procs && procs < 40) { score += 8; det |= NP_SB_PROC40; }
+        else if (procs && procs < 70) { score += 4; det |= NP_SB_PROC70; }
 
-    /* 4. known sandbox / monitoring modules already hard-fail in
-     * np_chk_bad_modules; here score the softer instrumented-host markers. */
-    u8* peb = np_peb();
-    if (peb) {
-        u8* ldr = *(u8**)(peb + PEB_LDR);
-        if (ldr) {
-            u8* head = ldr + LDR_IN_LOAD_ORDER;
-            u8* cur  = *(u8**)head;
-            while (cur != head) {
-                u16 len = *(u16*)(cur + LDR_ENTRY_BASENAME);
-                u16* nm = *(u16**)(cur + LDR_ENTRY_BASENAME + 8);
-                if (nm && len) {
-                    len >>= 1;
-                    if (len == 12 && (nm[0]=='d'||nm[0]=='D') && (nm[1]=='b'||nm[1]=='B') &&
-                        (nm[2]=='g'||nm[2]=='G') && (nm[3]=='h'||nm[3]=='H')) score += 6;   /* dbghelp/dbgcore */
-                    if (len >= 7 && (nm[0]=='s'||nm[0]=='S') && (nm[1]=='b'||nm[1]=='B') &&
-                        (nm[2]=='i'||nm[2]=='I') && (nm[3]=='e'||nm[3]=='E')) score += 6;  /* sbie* */
+        u64 ppid = np_parent_pid();
+        if (ppid) {
+            u16 pname[96];
+            if (np_snap_name_of(ppid, pname, 96)) {
+                u32 plen = np_u16_len(pname);
+                if (np_u16_has_ci(pname, plen, "cmd.exe") ||
+                    np_u16_has_ci(pname, plen, "powershell") ||
+                    np_u16_has_ci(pname, plen, "pwsh") ||
+                    np_u16_has_ci(pname, plen, "wscript") ||
+                    np_u16_has_ci(pname, plen, "cscript") ||
+                    np_u16_has_ci(pname, plen, "python") ||
+                    np_u16_has_ci(pname, plen, "rundll32") ||
+                    np_u16_has_ci(pname, plen, "analyzer") ||
+                    np_u16_has_ci(pname, plen, "sandbox") ||
+                    np_u16_has_ci(pname, plen, "cuckoo") ||
+                    np_u16_has_ci(pname, plen, "joebox")) {
+                    score += 10; det |= NP_SB_PARENT;
+                } else if (np_u16_has_ci(pname, plen, "svchost")) {
+                    score += 4; det |= NP_SB_SVCHOST;
                 }
-                cur = *(u8**)cur;
             }
         }
     }
 
-    /* 5. RDTSCP + RDTSC timing spread across core migration */
+    np_dbg_stage(3);
+
+    /* 4. uptime / user-input correlation */
+    u64 uptime_ms = 0;
+    u32 idle_ms = 0xFFFFFFFFu;
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (k32) {
+        typedef u64 (__attribute__((ms_abi)) *np_gtt_fn)(void);
+        np_gtt_fn gtt = (np_gtt_fn)np_export_by_name(k32, np_s_gtt);
+        if (gtt) uptime_ms = gtt();
+    }
+    if (uptime_ms) idle_ms = np_input_idle_ms(uptime_ms);
+    /* "a human is around" = input seen within the last 10 minutes */
+    u32 human = (idle_ms != 0xFFFFFFFFu && idle_ms < 600000ull) ? 1u : 0u;
+
+    if (uptime_ms >= 180000ull && idle_ms != 0xFFFFFFFFu &&
+        (u64)idle_ms >= uptime_ms - 5000ull) {
+        score += 12; det |= NP_SB_NOINPUT;      /* nothing typed/clicked since boot */
+    }
+    if (!human && uptime_ms >= 2700000ull && idle_ms != 0xFFFFFFFFu &&
+        (u64)idle_ms >= 1800000ull) {
+        score += 8; det |= NP_SB_IDLE;          /* idle analysis VM */
+    }
+
+    np_dbg_stage(4);
+
+    /* 5. virtual firmware / disk artifacts (VMware, VirtualBox, QEMU, Xen) */
+    if (np_firmware_artifacts()) { score += 8; det |= NP_SB_FIRMWARE; }
+
+    np_dbg_stage(5);
+
+    /* 6. modules injected from user-writable locations */
+    if (np_injected_module_paths()) { score += 25; det |= NP_SB_INJECT; }
+
+    np_dbg_stage(6);
+
+    /* 7. known analysis / monitoring modules */
+    if (np_chk_bad_modules()) { score += 25; det |= NP_SB_MOD; }
+    if (np_dbghelp_family())   { score += 6;  det |= NP_SB_DBGHELP; }
+
+    np_dbg_stage(7);
+
+    /* 8. timing evidence */
     u64 t1 = np_rdtscp();
     u64 t2 = np_rdtsc();
     u64 spread = t2 > t1 ? t2 - t1 : t1 - t2;
-    if (spread > 0x40000000ull) score += 6;
+    if (spread > 0x40000000ull) { score += 5; det |= NP_SB_TSCSPREAD; }
 
-    /* 6. per-CPU core mask consistency: online sandboxes often report a
-     * synthetic 1-vCPU topology with an implausible APIC core mask. */
     u64 mask = np_cpu_core_mask();
-    if ((mask & 0xFFFF) == 0 || ((mask >> 16) & 0xFF) == 0) score += 3;
+    if ((mask & 0xFFFF) == 0 || ((mask >> 16) & 0xFF) == 0) { score += 3; det |= NP_SB_COREMASK; }
 
-    /* 7. known online-analysis sandbox DLLs (微步 and peers) walk the loader
-     * list. These hard-fail in np_chk_bad_modules only at the highest level;
-     * here they add weight to the cumulative score. */
-    if (np_chk_bad_modules()) score += 20;
+    if (np_sleep_compressed()) { score += 15; det |= NP_SB_SLEEP; }
 
-    /* 8. sleep compression: sandboxes accelerate Sleep/SleepEx and wall-clock
-     * time. Measure GetTickCount64 across a short busy-wait; a compressed
-     * wall clock (delta far below real elapsed cycles) is a strong VM signal. */
-    {
-        void* k32 = np_module_by_name(np_s_kernel32);
-        if (k32) {
-            typedef u64 (__attribute__((ms_abi)) *np_gtt_fn)(void);
-            np_gtt_fn gtt = (np_gtt_fn)np_export_by_name(k32, np_s_gtt);
-            if (gtt) {
-                u64 wall0 = gtt();
-                u64 cyc0 = np_rdtsc();
-                for (u32 i = 0; i < 64; i++) np_rdtscp();
-                u64 cyc1 = np_rdtsc();
-                u64 wall1 = gtt();
-                u64 cycles = cyc1 > cyc0 ? cyc1 - cyc0 : cyc0 - cyc1;
-                u64 wallms = wall1 >= wall0 ? wall1 - wall0 : wall0 - wall1;
-                // A real 2+ GHz core advances ~300k cycles per 1 ms of wall
-                // time. Sandboxes that virtualize RDTSC but run wall time fast
-                // produce an implausible ratio.
-                if (wallms == 0 || cycles / (wallms + 1) > 5000000ull) score += 8;
-            }
+    np_dbg_stage(8);
+
+    /* 9. display topology */
+    void* u32mod = np_module_by_name(np_s_user32);
+    if (u32mod) {
+        typedef int (__attribute__((ms_abi)) *np_gsm_fn)(int);
+        np_gsm_fn gsm = (np_gsm_fn)np_export_by_name(u32mod, np_s_gsm);
+        if (gsm) {
+            int w = gsm(0);   /* SM_CXSCREEN */
+            int h = gsm(1);   /* SM_CYSCREEN */
+            int m = gsm(80);  /* SM_CMONITORS */
+            if (w && h && w < 800) { score += 8; det |= NP_SB_RES800; }
+            else if (w && h && w < 1024) { score += 6; det |= NP_SB_RES1024; }
+            if (m == 0) { score += 4; det |= NP_SB_NOMON; }
         }
     }
 
-    /* 9. interactive desktop / user environment heuristics for 微步. */
-    {
-        void* u32mod = np_module_by_name(np_s_user32);
-        if (u32mod) {
-            typedef int (__attribute__((ms_abi)) *np_gsm_fn)(int);
-            np_gsm_fn gsm = (np_gsm_fn)np_export_by_name(u32mod, np_s_gsm);
-            if (gsm) {
-                if (gsm(0) < 800 || gsm(1) < 600) score += 8;   /* SM_CXSCREEN/SM_CYSCREEN */
-            }
-        }
-        // Environment template names common in ephemeral analysis VMs.
-        void* k32 = np_module_by_name(np_s_kernel32);
-        if (k32) {
-            typedef u32 (__attribute__((ms_abi)) *np_gevw_fn)(const char*, char*, u32);
-            np_gevw_fn ge = (np_gevw_fn)np_export_by_name(k32, "GetEnvironmentVariableA");
-            if (ge) {
-                char name[64]; np_memset(name, 0, sizeof(name));
-                char host[64]; np_memset(host, 0, sizeof(host));
-                ge("COMPUTERNAME", host, sizeof(host));
-                ge("USERNAME", name, sizeof(name));
-                const char* tmpl = host[0] ? host : name;
-                if ((tmpl[0] == 'W' && tmpl[1] == 'i' && tmpl[2] == 'n') ||
-                    (tmpl[0] == 'A' && tmpl[1] == 'd' && tmpl[2] == 'm' && tmpl[3] == 'i' && tmpl[4] == 'n') ||
-                    (tmpl[0] == 'U' && tmpl[1] == 's' && tmpl[2] == 'e' && tmpl[3] == 'r')) score += 10;
-            }
-        }
+    np_dbg_stage(9);
+
+    /* 10. ephemeral account / computer names (ignored while a human types) */
+    if (!human && np_template_name()) { score += 6; det |= NP_SB_TMPLNAME; }
+
+    np_dbg_stage(10);
+
+    /* 11. freshly imaged guest: only meaningful when the machine is headless
+     *     and weak - a developer's new install always has a taskbar. */
+    u32 age = np_install_age_days();
+    if (age != 0xFFFFFFFFu && !human && !np_taskbar_present() &&
+        (cpu <= 2 || (ram_bytes && ram_bytes < (4ull << 30)))) {
+        if (age < 3) { score += 10; det |= NP_SB_FRESH3; }
+        else if (age < 14) { score += 6; det |= NP_SB_FRESH14; }
     }
 
+    np_dbg_stage(11);
+
+    np_snap_free();
+
+    if (detail) *detail = det;
     return score;
 }
 
@@ -981,12 +1663,18 @@ static u32 np_chk_dump(void* base) {
 }
 
 /* ========================================================================
- * environment self-check (v2 flag bit 11)
+ * interactive-desktop self-check (v2 flag bit 11)
  *
- * Validates a real interactive desktop against pack-time thresholds. The
- * fields are absolute minimums so commodity hardware always passes, while
- * headless在线分析沙箱 workers fail. Every probe degrades to "pass" when the
- * backing API is unavailable.
+ * Old design applied absolute minimums (CPU / RAM / uptime / resolution)
+ * directly, so a machine that had just rebooted, a single-vCPU box, a 4 GB
+ * boundary machine or a 768p laptop was rejected even with a real user
+ * sitting in front of it - a false-positive factory.
+ *
+ * New design: a real interactive desktop short-circuits the check entirely.
+ * "Interactive" means user input within the last 15 minutes OR a visible
+ * shell taskbar. Only a genuinely headless environment is scored, and each
+ * missing minimum contributes a small weight; the pack-time threshold at
+ * +124 decides. Every probe degrades to "pass" when its API is unavailable.
  * ======================================================================== */
 
 static u32 np_chk_env(const u8* b) {
@@ -996,48 +1684,122 @@ static u32 np_chk_env(const u8* b) {
     u32 min_w      = np_rd32(b + 112);
     u32 min_h      = np_rd32(b + 116);
     u32 min_mon    = np_rd32(b + 120);
+    u32 threshold  = np_rd32(b + 124);
+    if (!threshold) threshold = 7u;
 
-    /* CPU count from the same NT basic-info block */
+    /* ---- gather environment facts (all optional) ---- */
+    u32 cpu = 0;
+    u64 ram_bytes = 0;
+    u64 uptime_ms = 0;
+    u32 idle_ms = 0xFFFFFFFFu;
+    int w = 0, h = 0, mon = 0;
+    int taskbar = np_taskbar_present();
+
     void* ntdll = np_module_by_name(np_s_ntdll);
-    void* k32   = np_module_by_name(np_s_kernel32);
-    if (min_cpu && ntdll) {
+    if (ntdll) {
         typedef i32 (__attribute__((ms_abi)) *np_qsi_fn)(u32 cls, void* buf, u32 len, u32* ret);
         np_qsi_fn qsi = (np_qsi_fn)np_export_by_name(ntdll, np_s_qsi);
         if (qsi) {
-            u8 basic[64]; np_memset(basic, 0, sizeof(basic));
+            u8 basic[64];
+            np_memset(basic, 0, sizeof(basic));
             u32 ret = 0;
             if (qsi(NP_SIC_SYSTEM_BASIC_INFO, basic, sizeof(basic), &ret) >= 0) {
-                if ((u8)basic[0] < min_cpu) return 1;
-                u64 pages = *(u64*)(basic + 24);
-                u64 pageSize = *(u32*)(basic + 32);
-                if (min_ram_mb && pages && pageSize &&
-                    pages * pageSize < (u64)min_ram_mb * 1048576ull) return 1;
+                cpu = basic[0];
+                u64 pages = np_rd64(basic + 24);
+                u32 page_size = np_rd32(basic + 32);
+                ram_bytes = pages * (u64)page_size;
             }
         }
     }
+    void* k32 = np_module_by_name(np_s_kernel32);
+    if (k32) {
+        typedef u64 (__attribute__((ms_abi)) *np_gtt_fn)(void);
+        np_gtt_fn gtt = (np_gtt_fn)np_export_by_name(k32, np_s_gtt);
+        if (gtt) uptime_ms = gtt();
+    }
+    if (uptime_ms) idle_ms = np_input_idle_ms(uptime_ms);
 
-    if (min_uptime && k32) {
-        typedef u64 (__attribute__((ms_abi)) *np_uptime_fn)(void);
-        np_uptime_fn gtt = (np_uptime_fn)np_export_by_name(k32, np_s_gtt);
-        if (gtt && gtt() < (u64)min_uptime) return 1;
+    void* u32mod = np_module_by_name(np_s_user32);
+    if (u32mod) {
+        typedef int (__attribute__((ms_abi)) *np_gsm_fn)(int);
+        np_gsm_fn gsm = (np_gsm_fn)np_export_by_name(u32mod, np_s_gsm);
+        if (gsm) {
+            w = gsm(0);
+            h = gsm(1);
+            mon = gsm(80);
+        }
     }
 
-    if (min_w || min_h || min_mon) {
-        void* u32mod = np_module_by_name(np_s_user32);
-        if (u32mod) {
-            typedef int (__attribute__((ms_abi)) *np_gsm_fn)(int);
-            np_gsm_fn gsm = (np_gsm_fn)np_export_by_name(u32mod, np_s_gsm);
-            if (gsm) {
-                int w = gsm(0);   /* SM_CXSCREEN */
-                int h = gsm(1);   /* SM_CYSCREEN */
-                int m = gsm(80);  /* SM_CMONITORS */
-                if (min_w && w < (int)min_w) return 1;
-                if (min_h && h < (int)min_h) return 1;
-                if (min_mon && m < (int)min_mon) return 1;
-            }
+    /* ---- a real desktop short-circuits everything ---- */
+    u32 interactive = ((idle_ms != 0xFFFFFFFFu && idle_ms < 900000ull) || taskbar) ? 1u : 0u;
+    if (interactive) return 0;
+
+    /* ---- headless: score the missing minimums ---- */
+    u32 score = 0;
+    if (min_cpu && cpu && cpu < min_cpu) score += 3;
+    if (min_ram_mb && ram_bytes && ram_bytes < (u64)min_ram_mb * 1048576ull) score += 3;
+    if (min_uptime && uptime_ms < (u64)min_uptime) score += 3;
+    if (min_w && w && w < (int)min_w) score += 3;
+    if (min_h && h && h < (int)min_h) score += 3;
+    if (min_mon && mon && mon < (int)min_mon) score += 3;
+    if (!taskbar) score += 3;
+    if (uptime_ms > 300000ull && idle_ms != 0xFFFFFFFFu &&
+        (u64)idle_ms >= uptime_ms - 5000ull) score += 3;   /* no input since boot */
+
+    return (score >= threshold) ? 1u : 0u;
+}
+
+/* ========================================================================
+ * sandbox block path: show the notice and terminate cleanly
+ * ======================================================================== */
+
+static const u16 np_w_notice[]  = {
+    0x8BF7, 0x5728, 0x975E, 0x6C99, 0x7BB1, 0x5185, 0x4F7F, 0x7528, 0 };  /* 请在非沙箱内使用 */
+static const u16 np_w_caption[] = {
+    'N','o','v','a','P','r','o','t','e','c','t', 0 };
+
+static u32 __attribute__((ms_abi)) np_notice_thread(void* arg) {
+    (void)arg;
+    void* u32mod = np_module_by_name(np_s_user32);
+    if (u32mod) {
+        typedef int (__attribute__((ms_abi)) *np_mb_fn)(void*, const u16*, const u16*, u32);
+        np_mb_fn mb = (np_mb_fn)np_export_by_name(u32mod, "MessageBoxW");
+        if (mb) {
+            /* MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST */
+            mb(0, np_w_notice, np_w_caption, 0x00040030u);
         }
     }
     return 0;
+}
+
+/* Never returns. Shows "请在非沙箱内使用" (worker thread, 3 s budget so a
+ * headless worker cannot wedge on a modal box) and exits through
+ * ExitProcess, leaving no crash dump for the analysis pipeline. */
+static void np_block_sandbox(void) {
+    void* k32 = np_module_by_name(np_s_kernel32);
+    void* u32mod = np_module_by_name(np_s_user32);
+    if (u32mod) {
+        if (k32) {
+            typedef u64 (__attribute__((ms_abi)) *np_ct_fn)(void*, u64, void*, void*, u32, u32*);
+            np_ct_fn ct = (np_ct_fn)np_export_by_name(k32, "CreateThread");
+            if (ct) {
+                ct(0, 0x20000u, (void*)np_notice_thread, 0, 0, 0);
+            } else {
+                np_notice_thread(0);
+            }
+        } else {
+            np_notice_thread(0);
+        }
+    }
+    if (k32) {
+        typedef void (__attribute__((ms_abi)) *np_sleep_fn)(u32);
+        typedef void (__attribute__((ms_abi)) *np_exit_fn)(u32);
+        np_sleep_fn sl = (np_sleep_fn)np_export_by_name(k32, "Sleep");
+        np_exit_fn  xp = (np_exit_fn) np_export_by_name(k32, "ExitProcess");
+        if (sl) sl(3000);
+        if (xp) xp(0);
+    }
+    for (;;) { }   /* unreachable when ExitProcess resolved */
 }
 
 /* ========================================================================
@@ -1256,6 +2018,31 @@ u32 np_prot_start(void* base, void* hdr, void* blob, void* kern) {
     u32 flags = np_rd32(b + 8);
     if (!flags) return 0;
 
+    /* ---- environment gates first --------------------------------------
+     * The sandbox guard and the interactive-desktop self-check run before
+     * every other check so an analysis environment is stopped with a clear
+     * notice instead of an opaque crash, and gets no time to observe the
+     * remaining protections. Neither returns a failure id: on a positive
+     * verdict np_block_sandbox() terminates the process.                    */
+    if (flags & 0x200u) {
+        u32 threshold = np_rd32(b + 96);
+        if (threshold) {
+            u32 detail = 0;
+            u32 score = np_sandbox_score_ex(&detail);
+            if (score >= threshold && (detail & NP_SB_STRONG)) {
+                np_dbg_report(score, detail, threshold);
+                np_block_sandbox();
+                return NP_CHK_SANDBOX;   /* not reached */
+            }
+        }
+    }
+    if (flags & 0x800u) {
+        if (np_chk_env(b)) {
+            np_block_sandbox();
+            return NP_CHK_ENV;           /* not reached */
+        }
+    }
+
     void* ntqip = 0;
     void* getctx = 0;
     if (flags & 0x0F) {
@@ -1292,15 +2079,8 @@ u32 np_prot_start(void* base, void* hdr, void* blob, void* kern) {
         u64 expected = np_rd64(b + 80);
         if (!expected || np_machine_id() != expected) return NP_CHK_ACTIVATION;
     }
-    if (flags & 0x200u) {
-        u32 threshold = np_rd32(b + 96);
-        if (threshold && np_sandbox_score() >= threshold) return NP_CHK_SANDBOX;
-    }
     if (flags & 0x400u) {
         if (np_chk_dump(base)) return NP_CHK_DUMP;
-    }
-    if (flags & 0x800u) {
-        if (np_chk_env(b)) return NP_CHK_ENV;
     }
     if (flags & 0x40u) {
         if (np_chk_integrity(base, b)) return NP_CHK_INTEGRITY;

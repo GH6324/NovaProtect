@@ -361,7 +361,12 @@ np_launch2:
     # Keep the registers the protection runtime clobbers on the stack; rbx
     # (image base) and rsi (payload header) are callee saved and survive the
     # call by contract.
-    sub rsp, 40
+    # 48 (not 40): the fifteen entry pushes leave rsp 16-byte aligned, and the
+    # x64 ABI requires rsp to still be 16-byte aligned *at* the call so the
+    # runtime enters with rsp%16 == 8 like every other Windows function. With
+    # 40 the runtime ran misaligned by 8 and any 16-byte-aligned stack local
+    # (movaps/movdqa codegen) faulted with 0xC0000005.
+    sub rsp, 48
     mov ecx, dword ptr [rsi+104]       # NPP1 data blob RVA
     lea rdx, [rbx+rcx]
     mov qword ptr [rsp], rdx
@@ -378,7 +383,7 @@ np_prot_no_kernel:
     mov eax, dword ptr [rsi+100]       # protection code RVA
     lea rax, [rbx+rax]
     call rax
-    add rsp, 40
+    add rsp, 48
     test eax, eax
     jnz np_hard_fail
 np_no_prot:
