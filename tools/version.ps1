@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [ValidateSet('Check', 'Sync', 'Seal', 'Bump')]
   [string]$Action = 'Check',
@@ -79,7 +79,7 @@ function Sync-Version([version]$version) {
   # 30 characters or the website release notes lose their tail.
   Write-Utf8 (Join-Path $root 'installer\version.iss') @"
 #define MyAppVersion "$text"
-#define MyAppVersionComments "新增 SDK 函数加密；强化反沙箱与反调试"
+#define MyAppVersionComments "修复反沙箱拦截崩溃；强化运行时稳定性"
 "@
 
   $websiteVersionPath = Join-Path $root 'website\VERSION'
@@ -117,8 +117,13 @@ function Get-SourceDigest {
     $path = Join-Path $root $relative
     if (-not (Test-Path -LiteralPath $path)) { continue }
     if ((Get-Item -LiteralPath $path).PSIsContainer) {
+      # Exclusion must be evaluated on the path RELATIVE to $root: matching
+      # the full path would let a checkout that itself lives under a
+      # directory named "artifacts" exclude the entire tree.
       Get-ChildItem -LiteralPath $path -Recurse -File | Where-Object {
-        $_.FullName -notmatch '\\(bin|obj|artifacts|evidence|_reg|App_Data|__pycache__)\\' -and
+        $rel = $_.FullName.Substring($root.Length).TrimStart('\')
+        $rel -notmatch '^(bin|obj|artifacts|evidence|_reg|App_Data|__pycache__)\\' -and
+        $rel -notmatch '\\(bin|obj|artifacts|evidence|_reg|App_Data|__pycache__)\\' -and
         $_.Extension -notin @('.exe', '.dll', '.pdb', '.obj', '.o', '.bin', '.res', '.ldimg', '.png', '.ico') -and
         $derived -notcontains $_.Name
       }

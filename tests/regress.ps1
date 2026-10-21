@@ -16,6 +16,12 @@ $script:fail = 0
 
 function Run-One {
   param([string]$Name, [string]$In, [string[]]$Options, [string]$Expect, [int]$ExpectExit = 0)
+  if (-not (Test-Path -LiteralPath $In)) {
+    # fixture binaries are build artifacts stripped from the source package;
+    # a missing fixture is an environment limitation, not a product failure
+    Write-Host "[SKIP] $Name : fixture missing ($In)"
+    return
+  }
   $exe = Join-Path $out "$Name.exe"
   Remove-Item $exe -ErrorAction SilentlyContinue
   $pa = @($In, '-o', $exe) + $Options
@@ -90,6 +96,8 @@ function Read-NppFacts {
       Flags = [BitConverter]::ToUInt32($bytes, $i + 8)
       ExpectedMachine = [BitConverter]::ToUInt64($bytes, $i + 80)
       VmCount = [BitConverter]::ToUInt32($bytes, $i + 88)
+      SandboxThreshold = [BitConverter]::ToUInt32($bytes, $i + 96)
+      EnvThreshold = [BitConverter]::ToUInt32($bytes, $i + 124)
     }
   }
   return $null
@@ -202,6 +210,30 @@ Run-One 'x64_imports'   "$root\tests\test_target.exe" @('-mode','ultra','-memory
 Run-One 'x64_imports_ad' "$root\tests\test_target.exe" @('-mode','ultra','-ad','3','-avm','2','-memory','-imports','-resources') 'Hash: 0x6DD33F53'
 Run-One 'x86_imports'   "$root\tests\hostname32.exe" @('-mode','ultra','-memory','-imports') 'sudfiona'
 Run-One 'x86_imports_ad' "$root\tests\hostname32.exe" @('-mode','ultra','-ad','3','-avm','2','-memory','-imports','-resources') 'sudfiona'
+
+Write-Host '--- sandbox guard / anti-dump / interactive-desktop check ---'
+# Every case must still run to completion on a genuine desktop: the sandbox
+# score and the headless-env score are both zero here (taskbar + input).
+Run-One 'x64_sandbox_guard' "$root\tests\test_target.exe" @('-sandbox-guard') 'Hash: 0x6DD33F53'
+Run-One 'x64_anti_dump'    "$root\tests\test_target.exe" @('-anti-dump') 'Hash: 0x6DD33F53'
+Run-One 'x64_env_check'    "$root\tests\test_target.exe" @('-env-check') 'Hash: 0x6DD33F53'
+Run-One 'x64_sandbox_all'  "$root\tests\test_target.exe" @('-mode','ultra','-mut','3','-vm','9','-ad','3','-avm','2','-memory','-sandbox-guard','-anti-dump','-env-check') 'Hash: 0x6DD33F53'
+Run-One 'x64_sandbox_thr'  "$root\tests\test_target.exe" @('-sandbox-guard','-sandbox-threshold','33','-env-check','-env-threshold','5') 'Hash: 0x6DD33F53'
+
+$sboxFacts = Read-NppFacts (Join-Path $out 'x64_sandbox_all.exe')
+if ($null -ne $sboxFacts -and ($sboxFacts.Flags -band 0xE00) -eq 0xE00 -and $sboxFacts.SandboxThreshold -eq 40 -and $sboxFacts.EnvThreshold -eq 7) {
+  Write-Host '[ OK ] x64_sandbox_all descriptor flags/thresholds'
+} else {
+  Write-Host ('[FAIL] x64_sandbox_all descriptor: flags=0x{0:X8} sbox={1} env={2}' -f $(if ($null -ne $sboxFacts) { $sboxFacts.Flags } else { 0 }), $(if ($null -ne $sboxFacts) { $sboxFacts.SandboxThreshold } else { -1 }), $(if ($null -ne $sboxFacts) { $sboxFacts.EnvThreshold } else { -1 }))
+  $script:fail++
+}
+$thrFacts = Read-NppFacts (Join-Path $out 'x64_sandbox_thr.exe')
+if ($null -ne $thrFacts -and ($thrFacts.Flags -band 0xA00) -eq 0xA00 -and $thrFacts.SandboxThreshold -eq 33 -and $thrFacts.EnvThreshold -eq 5) {
+  Write-Host '[ OK ] x64_sandbox_thr descriptor overrides'
+} else {
+  Write-Host ('[FAIL] x64_sandbox_thr descriptor: flags=0x{0:X8} sbox={1} env={2}' -f $(if ($null -ne $thrFacts) { $thrFacts.Flags } else { 0 }), $(if ($null -ne $thrFacts) { $thrFacts.SandboxThreshold } else { -1 }), $(if ($null -ne $thrFacts) { $thrFacts.EnvThreshold } else { -1 }))
+  $script:fail++
+}
 
 Write-Host '--- section encryption / trimming / activation ---'
 Run-One 'x64_noencrypt' "$root\tests\vm_target.exe" @('-mode','virtualization','-vm','5','-noencrypt') 'VM-OK'

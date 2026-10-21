@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -33,12 +35,17 @@ int main(int argc, char** argv) {
                         DEBUG_ONLY_THIS_PROCESS, nullptr, nullptr, &si, &pi)) {
         printf("CreateProcess failed %lu\n", GetLastError()); return 3;
     }
+    uint64_t g_base_dummy = 0;
     int count = 0;
     for (;;) {
         DEBUG_EVENT de;
         if (!WaitForDebugEvent(&de, INFINITE)) break;
         DWORD cont = DBG_CONTINUE;
-        if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+        if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+            g_base_dummy = (uint64_t)de.u.CreateProcessInfo.lpBaseOfImage;
+            printf("image base = 0x%llX\n", (unsigned long long)g_base_dummy);
+            fflush(stdout);
+        } else if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
             auto& ex = de.u.Exception;
             DWORD code = ex.ExceptionRecord.ExceptionCode;
             ULONG_PTR addr = (ULONG_PTR)ex.ExceptionRecord.ExceptionAddress;
@@ -67,6 +74,31 @@ int main(int argc, char** argv) {
                        (unsigned long long)ctx.R12,(unsigned long long)ctx.R13,(unsigned long long)ctx.R14,(unsigned long long)ctx.R15);
             }
             if (ht) CloseHandle(ht);
+            if (count == 1) {
+                // first exception: dump code bytes and probe the NPP1 descriptor
+                unsigned char buf[64];
+                SIZE_T rd = 0;
+                if (ReadProcessMemory(pi.hProcess, (void*)rip, buf, sizeof(buf), &rd) && rd == sizeof(buf)) {
+                    printf("     code@rip:");
+                    for (int i = 0; i < 64; i++) printf(" %02X", buf[i]);
+                    printf("\n");
+                }
+                for (uint64_t pg = g_base_dummy; pg < g_base_dummy + 0x180000ull; pg += 0x1000) {
+                    unsigned char page[0x1000];
+                    if (!ReadProcessMemory(pi.hProcess, (void*)pg, page, sizeof(page), &rd) || rd != sizeof(page)) continue;
+                    for (size_t o = 0; o + 8 <= sizeof(page); o += 4) {
+                        uint32_t m; memcpy(&m, page + o, 4);
+                        if (m != 0x3150504Eu) continue;
+                        uint64_t va = pg + o;
+                        auto r32 = [&](uint64_t a) { uint32_t v = 0; ReadProcessMemory(pi.hProcess, (void*)a, &v, 4, &rd); return v; };
+                        uint32_t ver = r32(va + 4), flg = r32(va + 8);
+                        if (ver < 1 || ver > 2 || !flg || flg > 0xFFF) continue;
+                        printf("     NPP1 @ +0x%llX ver=%u flags=0x%03X adlvl=%u avlvl=%u sbthr=%u envthr=%u\n",
+                               (unsigned long long)(va - g_base_dummy), ver, flg,
+                               r32(va + 12), r32(va + 16), r32(va + 96), r32(va + 124));
+                    }
+                }
+            }
             fflush(stdout);
             count++;
             if (count > 60) { printf("too many events, detaching\n"); DebugActiveProcessStop(de.dwProcessId); break; }

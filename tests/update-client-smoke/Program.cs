@@ -39,12 +39,16 @@ HttpResponseMessage Chunked(byte[] content, string mediaType = "application/octe
 
 var endpoint = new Uri("https://nova.fbi.plus/");
 var current = ProductInfo.Version;
+// The forced-update fixture must stay strictly newer than the shipping client
+// or the "IsNewer" assertion silently rots at every version bump. Derive it
+// from the current version instead of hardcoding a release number.
+var forcedVersion = new Version(Version.Parse(current).Major, Version.Parse(current).Minor, Version.Parse(current).Build + 1).ToString(3);
 var fixtureHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("novaprotect-update-fixture"))).ToLowerInvariant();
 string UpdateJson(string clientVersion, string fileName, long size, string sha256, string downloadPath, string minimumClientVersion, bool forceUpdate) =>
     JsonSerializer.Serialize(new
     {
         clientVersion,
-        websiteVersion = "2.2.11",
+        websiteVersion = "2.2.16",
         fileName,
         size,
         sha256,
@@ -73,8 +77,8 @@ using (var client = new UpdateClient(endpoint, new FakeHandler((request, _) =>
 }
 
 using (var client = new UpdateClient(endpoint, new FakeHandler((_, _) => Task.FromResult(Response(
-    UpdateJson("2.3.0", "NovaProtect-Setup-2.3.0.exe", 8192, fixtureHash,
-        "/api/releases/current/download?version=2.3.0&sha256=" + fixtureHash, "2.2.6", true))))))
+    UpdateJson(forcedVersion, $"NovaProtect-Setup-{forcedVersion}.exe", 8192, fixtureHash,
+        $"/api/releases/current/download?version={forcedVersion}&sha256={fixtureHash}", "2.2.6", true))))))
 {
     var result = await client.CheckForUpdateAsync();
     Check(result.Error is null && result.Update is { IsNewer: true, IsRequired: true, ForceUpdate: true }, "newer forced update is marked required");
