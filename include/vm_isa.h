@@ -147,10 +147,19 @@ public:
     //   imageBase   guest image base (for absolute/RIP-relative rewrites)
     //   complexity  1..10, controls extra obfuscation (opaque nops, padding)
     //   mutationLevel 0..3, reserved for mutation cooperation
+    //   target64    true for x64 images.  The wire VM is a 64-bit
+    //               machine, so in a 64-bit stream a non-REX.W (32-bit)
+    //               register-writing or flag-affecting form cannot be
+    //               reproduced faithfully -- zero-extension of the upper
+    //               half and 32-bit carry/sign flags differ -- and
+    //               terminates translation (the packer then keeps the
+    //               region native).  In a 32-bit image every instruction
+    //               is 32-bit by definition, so callers pass false.
     static VMLoweredBlock translate(const uint8_t* code, size_t size,
                              uint64_t guestRip, uint64_t imageBase,
                              uint8_t complexity = 5,
-                             uint8_t mutationLevel = 1);
+                             uint8_t mutationLevel = 1,
+                             bool target64 = true);
 };
 
 // ============================================================

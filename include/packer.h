@@ -7,6 +7,8 @@
 #include "anti_debug.h"
 #include <memory>
 #include <functional>
+#include <random>
+#include <cstdint>
 
 namespace np {
 
@@ -79,6 +81,22 @@ private:
     // Generate unpacker stub code
     std::vector<uint8_t> generateUnpackerStub(bool is64, uint32_t data_rva, uint32_t data_size);
 
+    // One VM region descriptor emitted into the NPP1 payload (runtime
+    // np_vm_install reads the table at offset 20 / count at 88).
+    struct VmRegion {
+        uint32_t rva, size, bc_off, bc_len, rev_off, reg_mask, nonce;
+    };
+
+    // Lower one code range [start, end) to VM bytecode. Shared by the SDK
+    // marker path and the scanned-function path (-func). Returns false when
+    // the range cannot be virtualized (undecodable, uses RSP/RBP, too small
+    // for the trampoline, or the region table is full); the reason is
+    // reported through the progress channel. `selected` may be null, in
+    // which case the global defaults apply.
+    bool vmLowerRegion(PELib& pe, std::vector<uint8_t>& data, std::vector<VmRegion>& vm_regions,
+                       std::mt19937_64& rng, uint32_t start, uint32_t end,
+                       const FunctionProtect* selected, const char* origin);
+
     void progress(int pct, const std::string& msg) {
         if (progress_) progress_(pct, msg);
     }
@@ -108,6 +126,7 @@ private:
     // Protection runtime (.np_prot) section RVAs published through the payload
     // header at offsets 100/104/108/112.
     uint32_t prot_code_rva_ = 0;
+    uint32_t prot_bss_rva_ = 0;
     uint32_t prot_data_rva_ = 0;
     uint32_t prot_kernel_rva_ = 0;
     uint32_t prot_code_size_ = 0;
@@ -116,7 +135,7 @@ private:
 };
 
 // NovaProtect SDK header. Marker bytes stay backward compatible with NovaPack 1.x.
-constexpr const char* NOVAPROTECT_SDK_VERSION = "2.3.0";
+constexpr const char* NOVAPROTECT_SDK_VERSION = "2.3.2";
 constexpr const char* NOVAPACK_SDK_VERSION = NOVAPROTECT_SDK_VERSION;
 
 #if defined(_MSC_VER) && !defined(__clang__)

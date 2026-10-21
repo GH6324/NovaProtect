@@ -201,7 +201,13 @@ enum class ProtectLevel : uint8_t {
     Ultra       = 3  // Virtualization + Mutation
 };
 
-// Function protection descriptor (from SDK markers)
+// Origin of a function protection descriptor.
+enum class FunctionSource : uint8_t {
+    SdkMarker = 0,   // NOVAPROTECT_BEGIN/END pair detected in the target
+    ScanFunction = 1 // function selected in the client's function scanner
+};
+
+// Function protection descriptor (from SDK markers or the function scanner)
 struct FunctionProtect {
     uint32_t rva_start = 0;       // first byte after begin marker
     uint32_t rva_end = 0;         // end marker address (exclusive)
@@ -211,6 +217,7 @@ struct FunctionProtect {
     uint8_t vm_complexity = 5;    // 1-10, affects dispatch complexity
     uint8_t vm_mutation = 1;      // 0-3, mutation strength
     bool vm_lock_to_key = false;  // activation-bound region
+    FunctionSource source = FunctionSource::SdkMarker;
 };
 
 // Packer configuration
@@ -248,9 +255,10 @@ struct PackerConfig {
     bool resource_protection  = false;
     uint8_t anti_vm_level     = 0;
     bool enable_sandbox_guard = false;   // NPP1 bit9: cumulative sandbox scoring
-    uint32_t sandbox_score_threshold = 34; // default tuned for 微步-style hosts
+    uint32_t sandbox_score_threshold = 40; // default tuned for 微步-style hosts
     bool enable_anti_dump     = false;   // NPP1 bit10: live-memory dump self-check
     bool enable_env_check     = false;   // NPP1 bit11: interactive desktop minimums
+    uint32_t env_score_threshold = 7;    // NPP1 +124: headless env score block point
     uint32_t min_cpu_count    = 2;
     uint32_t min_ram_mb       = 4096;
     uint32_t min_uptime_ms    = 3000;
