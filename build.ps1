@@ -101,11 +101,78 @@ function Build-Prot {
   if ($LASTEXITCODE -ne 0) { throw 'gcc prot64 failed' }
   & ld.exe -m i386pep -T runtime\prot64.ld --section-alignment 16 --file-alignment 16 -o runtime\prot64.ldimg runtime\prot64_entry.o runtime\prot64.o
   if ($LASTEXITCODE -ne 0) { throw 'ld prot64 failed' }
-  & objcopy.exe -O binary -j .np_text -j .np_rdat runtime\prot64.ldimg runtime\prot64.bin
+  & objcopy.exe -O binary -j .np_text -j .np_rdat -j .np_data runtime\prot64.ldimg runtime\prot64.bin
   if ($LASTEXITCODE -ne 0) { throw 'objcopy prot64 failed' }
+
+  # Section sizes and VMAs from the link image. objcopy -O binary lays the
+  # sections out at their relative VMAs and keeps the alignment gaps, so a
+  # section's offset inside prot64.bin is (VMA - link base) - NOT the sum of
+  # the preceding section sizes.
+  $bssSize = 0
+  $bssVma = 0
+  $secVma = @{ '.np_text' = 0; '.np_rdat' = 0; '.np_data' = 0 }
+  $secSize = @{ '.np_text' = 0; '.np_rdat' = 0; '.np_data' = 0 }
+  $hdr = & objdump.exe -h runtime\prot64.ldimg 2>$null | Out-String
+  foreach ($ln in $hdr -split "`r?`n") {
+    if ($ln -match '^\s*\d+\s+(\.np_\w+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)') {
+      $nm = $Matches[1]
+      if ($secSize.ContainsKey($nm)) {
+        $secSize[$nm] = [Convert]::ToUInt32($Matches[2], 16)
+        $secVma[$nm]  = [Convert]::ToUInt64($Matches[3], 16)
+      }
+      if ($nm -eq '.np_bss') {
+        $bssSize = [Convert]::ToUInt32($Matches[2], 16)
+        $bssVma  = [Convert]::ToUInt64($Matches[3], 16)
+      }
+    }
+  }
+
+  # Link-time base from the linker script (must stay the single source).
+  $linkBase = 0
+  foreach ($ln in ([IO.File]::ReadAllLines("$root\runtime\prot64.ld"))) {
+    if ($ln -match '^\s*\.\s*=\s*0x([0-9a-fA-F]+)\s*;') { $linkBase = [Convert]::ToUInt64($Matches[1], 16); break }
+  }
+  if ($linkBase -eq 0) { throw 'could not parse link base from runtime\prot64.ld' }
 
   $pb = [IO.File]::ReadAllBytes("$root\runtime\prot64.bin")
   if ($pb.Length -eq 0) { throw 'prot64 blob is empty' }
+
+  # Layout invariants the packer and the runtime's PC-relative references
+  # both depend on. A failure here means the linker script was changed in a
+  # way that desynchronises the extracted blob from the VMA space.
+  if ($secVma['.np_text'] -ne $linkBase) { throw 'np_text does not start at the link base' }
+  foreach ($nm in @('.np_text', '.np_rdat', '.np_data')) {
+    $o = $secVma[$nm] - $linkBase
+    if ($o + $secSize[$nm] -gt $pb.Length) {
+      throw ("$nm (VMA 0x$($secVma[$nm].ToString('x'))) extends past prot64.bin ($($pb.Length) bytes)")
+    }
+  }
+  if ($bssVma -ne 0 -and ($bssVma - $linkBase) -ne $pb.Length) {
+    throw ("np_bss VMA 0x$($bssVma.ToString('x')) is not directly behind prot64.bin (blob $($pb.Length) bytes) - the packer deploys the zeroed statics window there")
+  }
+
+  # Tripwire: the blob is deployed at an arbitrary load base with no reloc
+  # table, so every reference must be PC-relative. An 8-byte value inside the
+  # data sections that points back into the link-time image means someone
+  # reintroduced a pointer table (const char* array / struct with pointer
+  # members) - it would dangle at run time. Fail the build instead.
+  $extent = [uint64]$pb.Length + [uint64]$bssSize
+  $bad = @()
+  foreach ($nm in @('.np_rdat', '.np_data')) {
+    $o = $secVma[$nm] - $linkBase
+    $s = $secSize[$nm]
+    if ($s -lt 8) { continue }
+    for ($i = 0; $i + 8 -le $s; $i++) {
+      $v = [BitConverter]::ToUInt64($pb, $o + $i)
+      if ($v -ge $linkBase -and $v -lt ($linkBase + $extent)) {
+        $bad += ("$nm+0x{0:x} -> 0x{1:x}" -f $i, $v)
+      }
+    }
+  }
+  if ($bad.Count -gt 0) {
+    throw ("prot64 blob contains $($bad.Count) absolute link-time pointer(s) in .np_rdat/.np_data: " + ($bad -join '; ') + ". Pointer tables dangle once the packer deploys the blob at a load base != 0x$($linkBase.ToString('x')). Use fixed-width char matrices (see kTemplates/kTags) so references stay RIP-relative.")
+  }
+
   $sb = New-Object System.Text.StringBuilder
   [void]$sb.AppendLine('#pragma once')
   [void]$sb.AppendLine('#include <cstdint>')
@@ -124,8 +191,17 @@ function Build-Prot {
   }
   $sb.AppendLine('};') | Out-Null
   $sb.AppendLine("inline constexpr uint32_t kProtBlob64Size = $($pb.Length);") | Out-Null
+  $sb.AppendLine("inline constexpr uint32_t kProtBlob64BssSize = $bssSize;") | Out-Null
+  $sb.AppendLine("inline constexpr uint64_t kProtBlob64LinkBase = 0x$($linkBase.ToString('x'));") | Out-Null
+  # An absent section has size 0 - emit 0/0 instead of a wrapped offset.
+  $rdOff = if ($secSize['.np_rdat']) { $secVma['.np_rdat'] - $linkBase } else { 0 }
+  $dtOff = if ($secSize['.np_data'])  { $secVma['.np_data']  - $linkBase } else { 0 }
+  $sb.AppendLine("inline constexpr uint32_t kProtBlob64RdataOff = $rdOff;") | Out-Null
+  $sb.AppendLine("inline constexpr uint32_t kProtBlob64RdataSize = $($secSize['.np_rdat']);") | Out-Null
+  $sb.AppendLine("inline constexpr uint32_t kProtBlob64DataOff = $dtOff;") | Out-Null
+  $sb.AppendLine("inline constexpr uint32_t kProtBlob64DataSize = $($secSize['.np_data']);") | Out-Null
   [IO.File]::WriteAllText("$root\src\prot_blob.h", $sb.ToString(), $utf8)
-  Write-Host "[prot] $($pb.Length) bytes -> src\prot_blob.h"
+  Write-Host "[prot] $($pb.Length) bytes (+$bssSize bss, rdata @$rdOff+$($secSize['.np_rdat'])) -> src\prot_blob.h"
   Pop-Location
 }
 function Build-Mut {
@@ -221,7 +297,10 @@ function Build-WinUi {
   }
   if ($LASTEXITCODE -ne 0) { Pop-Location; throw 'WinUI build failed' }
   Write-Host '[winui] ok'
-  if (Test-Path -LiteralPath $vmpSdkRuntime) {
+  # $vmpSdkRuntime is empty when the commercial SDK is absent; Test-Path throws
+  # on an empty LiteralPath under ErrorActionPreference=Stop and would abort
+  # the whole build after every artifact was already produced.
+  if ($vmpSdkRuntime -and (Test-Path -LiteralPath $vmpSdkRuntime)) {
     Copy-Item -LiteralPath $vmpSdkRuntime -Destination (Join-Path $root 'ui\bin\x64\Release\net10.0-windows10.0.19041.0\win-x64\VMProtectSDK64.dll') -Force
   }
   & (Join-Path $root 'tools\client-integrity.ps1') -Action Sign -Directory (Join-Path $root 'ui\bin\x64\Release\net10.0-windows10.0.19041.0\win-x64')

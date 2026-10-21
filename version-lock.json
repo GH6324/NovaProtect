@@ -1,6 +1,6 @@
 {
-  "Product": "NovaProtect",
-  "Version": "2.2.4",
-  "SourceDigest": "AD077685FFB080A2AD2E9E9691A85B61620ACFDA8C7B8ABA1EB616C6C11FB865",
-  "SealedAt": "2026-10-17T00:11:47.7341084+08:00"
+    "Product":  "NovaProtect",
+    "Version":  "2.3.2",
+    "SourceDigest":  "0FAAB2322743104FA54E9CC738ACB916CEC5A4D9E11368B4DFA5FB4C57D798CA",
+    "SealedAt":  "2026-10-22T02:54:39.7123077+08:00"
 }
