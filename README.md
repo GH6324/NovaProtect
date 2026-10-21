@@ -66,7 +66,7 @@ pwsh -NoProfile -File .\tools\package-client-release.ps1 -RunTests
 pwsh -NoProfile -File .\tools\package-github-source.ps1
 ```
 
-生成 `artifacts\github-source\NovaProtect-<版本>-source.zip`（含顶层 `NovaProtect-<版本>/` 目录），排除 `artifacts/`（签名私钥、VMP 产物）、`output/`、构建中间物、商业 SDK 二进制与调试临时文件；`.gitignore` 已覆盖同类路径。仓库根已包含 `LICENSE`。
+生成 `artifacts\github-source\NovaProtect-<版本>-source.zip`（含顶层 `NovaProtect-<版本>/` 目录），排除 `artifacts/`（签名私钥、VMP 产物）、`output/`、构建中间物、商业 SDK 二进制与调试临时文件；`.gitignore` 已覆盖同类路径。发布前请补充 `LICENSE` 文件。
 
 ## 清理原则
 
