@@ -64,7 +64,7 @@ public static class PeInspector
             };
             var detail = targetArchitecture switch
             {
-                ProtectionTargetArchitecture.X64 when !isDotNet => "支持 x64 loader、导入虚拟化和 SDK marker 区域 VM；对象编辑器不会扫描任意函数。",
+                ProtectionTargetArchitecture.X64 when !isDotNet => "支持 x64 loader、导入虚拟化、SDK marker 区域 VM 与函数扫描 VM；函数面板可枚举并勾选任意函数。",
                 ProtectionTargetArchitecture.X86 when !isDotNet => "支持 x86 loader、区段加密和导入虚拟化；VM/许可运行时仅支持 x64。",
                 ProtectionTargetArchitecture.Arm64 => "已识别 ARM64，但当前核心没有 ARM64 loader，构建会被拒绝。",
                 _ when isDotNet => "已识别 C#/VB .NET EXE；采用 CLR 安全封装保护，不重写托管元数据和 IL。",

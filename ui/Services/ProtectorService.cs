@@ -56,6 +56,14 @@ public sealed partial class ProtectorService
         AddOptional(start, "-activation", options.ActivationBinding);
         foreach (var rule in options.ObjectRules)
         {
+            if (string.Equals(rule.Source, ProductInfo.FunctionSource, StringComparison.Ordinal) &&
+                string.Equals(rule.DetectorVersion, ProductInfo.FunctionDetectorVersion, StringComparison.Ordinal))
+            {
+                // Scanned function: the RVA range is the whole function body,
+                // so the packer lowers it directly (no marker wrapping).
+                Add(start, "-func", $"{rule.StartRva:X}-{rule.EndRva:X}-{ModeName(rule.Mode)}-{rule.VmComplexity}-{rule.MutationStrength}-{(rule.LockToActivation ? 1 : 0)}");
+                continue;
+            }
             if (!string.Equals(rule.Source, ProductInfo.MarkerSource, StringComparison.Ordinal) ||
                 !string.Equals(rule.DetectorVersion, ProductInfo.MarkerDetectorVersion, StringComparison.Ordinal))
                 throw new InvalidOperationException($"对象规则 {rule.Name} 不是由 NovaProtect SDK marker 检测器生成");

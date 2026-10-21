@@ -1,10 +1,10 @@
 # NovaProtect PHP 官网
 
-当前网站版本：`2.2.14`。运行时固定为 PHP 8.4、PHP-FPM 和宝塔 Nginx，不再依赖 ASP.NET Core、dotnet 或 systemd 应用服务。网站没有用户账户或会员系统，只提供客户端下载、更新日志和一个管理员口令保护的后台发布入口。
+当前网站版本：`2.2.16`。运行时固定为 PHP 8.4、PHP-FPM 和宝塔 Nginx，不再依赖 ASP.NET Core、dotnet 或 systemd 应用服务。网站没有用户账户或会员系统，只提供客户端下载、更新日志和一个管理员口令保护的后台发布入口。
 
 ## 宝塔安装
 
-1. 将 `artifacts/website-full/2.2.14/` 下的完整网站 ZIP 上传到服务器并解压。
+1. 将 `artifacts/website-full/2.2.16/` 下的完整网站 ZIP 上传到服务器并解压。
 2. 进入解压目录，以 root 执行：
 
    ```bash
@@ -29,7 +29,7 @@ bash deploy/rollback.sh
 
 ## 离线升级
 
-已有网站使用 `artifacts/website-upgrade/2.2.14/` 下的精简升级 ZIP。该包不包含 `install.sh`、`deploy/install.sh` 或首次安装 Nginx 配置，只能在已安装站点上执行：
+已有网站使用 `artifacts/website-upgrade/2.2.16/` 下的精简升级 ZIP。该包不包含 `install.sh`、`deploy/install.sh` 或首次安装 Nginx 配置，只能在已安装站点上执行：
 
 ```bash
 bash upgrade.sh --check-package
@@ -67,8 +67,8 @@ bash upgrade.sh
 - `app/`：管理员会话、安装向导和发布目录逻辑；
 - `deploy/`：宝塔 Nginx 配置器、安装和回滚脚本、SSH 管理员口令重置工具（`deploy/reset-admin-password.php`）；
 - `deploy/cdnfly-edge-policy.json`、`deploy/cdnfly-check.sh`、`deploy/CDNFLY.md`：CDNfly 规则映射、边缘预检和控制台步骤；
-- `downloads/`：经过 SHA-256 校验的 `NovaProtect-Setup-2.2.7.exe`；
-- 源客户端安装包独立保存于 `artifacts/client-installer/2.2.7/`，网站 ZIP 只携带部署所需的 `downloads/` 副本；
+- `downloads/`：经过 SHA-256 校验的 `NovaProtect-Setup-2.3.1.exe`；
+- 源客户端安装包独立保存于 `artifacts/client-installer/2.3.1/`，网站 ZIP 只携带部署所需的 `downloads/` 副本；
 - `SHA256SUMS`：包内文件清单。
 
 生产环境不要把 `data/`、管理员口令文件、会话目录或生产 Nginx 证书放入网站 ZIP；安装脚本会在 `/www/server/novaprotect/data` 创建持久目录。

@@ -173,6 +173,8 @@ public static class ProductInfo
     public const int BuildPlanSchemaVersion = 2;
     public const string MarkerSource = "NovaProtect SDK marker";
     public const string MarkerDetectorVersion = "novaprotect-sdk-marker-v1";
+    public const string FunctionSource = "PE 函数扫描";
+    public const string FunctionDetectorVersion = "novaprotect-function-scan-v1";
 
     private static string ResolveVersion()
     {

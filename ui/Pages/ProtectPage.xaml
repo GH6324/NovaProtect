@@ -256,7 +256,7 @@
                         <Grid>
                             <StackPanel>
                                 <TextBlock Text="函数 / 区域对象编辑器" Style="{StaticResource SectionTitleStyle}" />
-                                <TextBlock Text="对象只来自目标文件中的 NovaProtect SDK BEGIN/END marker；不提供任意函数扫描或虚构选择。"
+                                <TextBlock Text="SDK marker 区域直接来自目标文件中的 NovaProtect BEGIN/END 字节模式；任意函数的扫描与勾选请使用上方「函数保护」面板。"
                                            Style="{StaticResource SubtleTextStyle}" FontSize="12" />
                             </StackPanel>
                             <Button HorizontalAlignment="Right" Content="重新扫描 marker"
@@ -291,6 +291,107 @@
                                 <ToggleSwitch x:Name="MarkerActivationSwitch" Header="此区域要求启用全局激活绑定" IsEnabled="False"
                                               Toggled="MarkerEditor_Toggled" />
                                 <TextBlock x:Name="MarkerRangeText" Style="{StaticResource SubtleTextStyle}" FontSize="12" TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="14">
+                        <Grid>
+                            <StackPanel>
+                                <TextBlock Text="函数保护（VMP 式扫描）" Style="{StaticResource SectionTitleStyle}" />
+                                <TextBlock Text="扫描目标文件的函数表，勾选加入 VM 保护；也可一键添加所有可虚拟化函数。函数级保护与 SDK marker 区域可同时使用。"
+                                           Style="{StaticResource SubtleTextStyle}" FontSize="12" />
+                            </StackPanel>
+                            <Button HorizontalAlignment="Right" Content="扫描函数"
+                                    Style="{StaticResource RoundedButtonStyle}" Click="ScanFunctions_Click" />
+                        </Grid>
+                        <InfoBar x:Name="FunctionScanBar" IsOpen="True" IsClosable="False" Severity="Informational"
+                                 Title="等待目标" Message="选择 x64/x86 PE 后扫描函数表（x64 读取 .pdata 异常目录）。" />
+                        <Grid ColumnSpacing="16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="2*" />
+                                <ColumnDefinition Width="3*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="8">
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <ComboBox x:Name="FunctionFilterBox" SelectedIndex="0" HorizontalAlignment="Stretch"
+                                              SelectionChanged="FunctionFilterBox_SelectionChanged">
+                                        <ComboBoxItem Content="全部函数" Tag="all" />
+                                        <ComboBoxItem Content="仅可虚拟化" Tag="feasible" />
+                                        <ComboBoxItem Content="仅导出函数" Tag="export" />
+                                        <ComboBoxItem Content="仅已勾选" Tag="checked" />
+                                    </ComboBox>
+                                    <TextBlock Grid.Column="1" x:Name="FunctionCountText" VerticalAlignment="Center"
+                                               Style="{StaticResource SubtleTextStyle}" FontSize="12" />
+                                </Grid>
+                                <ListView x:Name="FunctionList" SelectionMode="None" MinHeight="200" MaxHeight="380">
+                                    <ListView.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid ColumnSpacing="10" Padding="2,5">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="200" />
+                                                    <ColumnDefinition Width="150" />
+                                                    <ColumnDefinition Width="70" />
+                                                    <ColumnDefinition Width="60" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
+                                                <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}" VerticalAlignment="Center" />
+                                                <TextBlock Grid.Column="1" Text="{Binding Name}" VerticalAlignment="Center"
+                                                           TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Grid.Column="2" Text="{Binding AddressRange}" VerticalAlignment="Center"
+                                                           FontFamily="Consolas" FontSize="12" />
+                                                <TextBlock Grid.Column="3" Text="{Binding Section}" VerticalAlignment="Center"
+                                                           FontSize="12" />
+                                                <TextBlock Grid.Column="4" Text="{Binding Size}" VerticalAlignment="Center"
+                                                           FontSize="12" />
+                                                <TextBlock Grid.Column="5" Text="{Binding Feasibility}" VerticalAlignment="Center"
+                                                           FontSize="12" Opacity="0.8" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListView.ItemTemplate>
+                                </ListView>
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Spacing="10">
+                                <TextBlock Text="批量操作" FontWeight="SemiBold" />
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <Button Content="全选" Style="{StaticResource RoundedButtonStyle}" Click="FunctionSelectAll_Click" />
+                                    <Button Grid.Column="1" Content="反选" Style="{StaticResource RoundedButtonStyle}" Click="FunctionInvert_Click" />
+                                </Grid>
+                                <Grid ColumnSpacing="8">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <Button Content="添加所有函数" Style="{StaticResource AccentActionButtonStyle}" Click="FunctionAddAll_Click" />
+                                    <Button Grid.Column="1" Content="清除勾选" Style="{StaticResource RoundedButtonStyle}" Click="FunctionClear_Click" />
+                                </Grid>
+                                <TextBlock Text="「添加所有函数」会勾选全部可虚拟化函数（无栈帧且容量足够）；VM 运行时会自动跳过无法翻译的函数并保持原生执行。"
+                                           Style="{StaticResource SubtleTextStyle}" FontSize="12" TextWrapping="Wrap" />
+                                <TextBlock Text="批量应用到勾选函数" FontWeight="SemiBold" />
+                                <ComboBox x:Name="FunctionBatchModeBox" SelectedIndex="1" HorizontalAlignment="Stretch">
+                                    <ComboBoxItem Content="继承全局模式" Tag="inherit" />
+                                    <ComboBoxItem Content="虚拟化" Tag="virtualization" />
+                                    <ComboBoxItem Content="Ultra（VM + 前置变异）" Tag="ultra" />
+                                    <ComboBoxItem Content="仅前置变异" Tag="mutation" />
+                                    <ComboBoxItem Content="跳过此函数" Tag="skip" />
+                                </ComboBox>
+                                <Grid ColumnSpacing="16">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <NumberBox x:Name="FunctionBatchVmBox" Header="VM 复杂度" Minimum="0" Maximum="10" Value="6"
+                                               SpinButtonPlacementMode="Compact" />
+                                    <NumberBox x:Name="FunctionBatchMutationBox" Grid.Column="1" Header="变异强度" Minimum="0" Maximum="3" Value="2"
+                                               SpinButtonPlacementMode="Compact" />
+                                </Grid>
+                                <ToggleSwitch x:Name="FunctionBatchActivationSwitch" Header="勾选函数要求启用全局激活绑定" />
+                                <Button Content="应用到勾选函数" HorizontalAlignment="Left"
+                                        Style="{StaticResource RoundedButtonStyle}" Click="FunctionApplyBatch_Click" />
+                                <TextBlock x:Name="FunctionSelectionSummary" Style="{StaticResource SubtleTextStyle}"
+                                           FontSize="12" TextWrapping="Wrap" Text="尚未勾选函数。" />
                             </StackPanel>
                         </Grid>
                     </StackPanel>

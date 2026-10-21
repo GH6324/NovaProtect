@@ -16,6 +16,8 @@ public sealed partial class ProtectPage : Page
     private readonly ProtectorService _protector = new();
     private readonly ObservableCollection<string> _virtualFiles = [];
     private readonly ObservableCollection<ProtectionObjectRule> _markerRules = [];
+    private readonly ObservableCollection<FunctionItem> _functionItems = [];
+    private List<ScannedFunction> _scannedFunctions = [];
     private CancellationTokenSource? _runCancellation;
     private PeSummary? _peSummary;
     private bool _settingDefaultOutput;
@@ -28,6 +30,7 @@ public sealed partial class ProtectPage : Page
         InitializeComponent();
         VirtualFilesList.ItemsSource = _virtualFiles;
         MarkerList.ItemsSource = _markerRules;
+        FunctionList.ItemsSource = _functionItems;
         CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(null);
         ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(null);
         var initialPreset = PresetBox.SelectedIndex;
@@ -87,6 +90,13 @@ public sealed partial class ProtectPage : Page
         {
             _peSummary = null;
             _markerRules.Clear();
+            _scannedFunctions = [];
+            _functionItems.Clear();
+            FunctionScanBar.Title = "等待目标";
+            FunctionScanBar.Message = "选择 x64/x86 PE 后扫描函数表（x64 读取 .pdata 异常目录）。";
+            FunctionScanBar.Severity = InfoBarSeverity.Informational;
+            FunctionScanBar.IsOpen = true;
+            UpdateFunctionSelectionSummary();
             ArchitectureBadge.Text = "等待有效文件";
             PeInfoBar.IsOpen = false;
             UpdateMarkerEditor();
@@ -363,6 +373,7 @@ public sealed partial class ProtectPage : Page
         };
         options.VirtualFiles.AddRange(_virtualFiles);
         options.ObjectRules.AddRange(_markerRules);
+        options.ObjectRules.AddRange(CollectFunctionRules());
         return options;
     }
 
@@ -467,6 +478,186 @@ public sealed partial class ProtectPage : Page
     }
 
     private void MarkerList_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateMarkerEditor();
+
+    // -------------------------------------------------------- functions ----
+
+    private void ScanFunctions_Click(object sender, RoutedEventArgs e)
+    {
+        ScanFunctionsInto();
+        UpdateCapabilitySummary();
+    }
+
+    // Runs the scanner and repopulates the list. Previously checked rows are
+    // re-matched by RVA so a rescan keeps the user's selection.
+    private void ScanFunctionsInto()
+    {
+        var path = InputPathBox.Text.Trim();
+        if (!File.Exists(path)) return;
+
+        var previous = _functionItems
+            .Where(item => item.IsSelected)
+            .ToDictionary(item => item.Rva);
+
+        var result = FunctionScanner.Scan(path);
+        _scannedFunctions = result.Functions.ToList();
+        _functionItems.Clear();
+
+        if (!result.Success)
+        {
+            FunctionScanBar.Title = "函数扫描失败";
+            FunctionScanBar.Message = result.Error;
+            FunctionScanBar.Severity = InfoBarSeverity.Error;
+            UpdateFunctionSelectionSummary();
+            return;
+        }
+
+        foreach (var function in _scannedFunctions)
+        {
+            var item = new FunctionItem(function);
+            if (previous.TryGetValue(function.Rva, out var kept))
+            {
+                item.IsSelected = true;
+                item.Mode = kept.Mode;
+                item.VmComplexity = kept.VmComplexity;
+                item.MutationStrength = kept.MutationStrength;
+                item.LockToActivation = kept.LockToActivation;
+            }
+            _functionItems.Add(item);
+        }
+
+        FunctionScanBar.Title = $"扫描到 {_scannedFunctions.Count} 个函数";
+        FunctionScanBar.Message = $"{result.Summary}；可虚拟化 {_scannedFunctions.Count(f => f.VmFeasible)} 个。" +
+                                  " VM 运行时会对无法翻译的函数自动回退原生执行。";
+        FunctionScanBar.Severity = InfoBarSeverity.Success;
+        RefreshFunctionList();
+        UpdateFunctionSelectionSummary();
+    }
+
+    private void FunctionFilterBox_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
+        RefreshFunctionList();
+
+    private void RefreshFunctionList()
+    {
+        if (FunctionList is null) return;
+        var filter = (FunctionFilterBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "all";
+        IEnumerable<FunctionItem> view = filter switch
+        {
+            "feasible" => _functionItems.Where(item => item.VmFeasible),
+            "export" => _functionItems.Where(item => item.IsExported),
+            "checked" => _functionItems.Where(item => item.IsSelected),
+            _ => _functionItems
+        };
+        FunctionList.ItemsSource = view.ToList();
+        FunctionCountText.Text = $"{view.Count()} / {_functionItems.Count}";
+    }
+
+    private void FunctionSelectAll_Click(object sender, RoutedEventArgs e) => SetFunctionSelection(true, false);
+
+    private void FunctionInvert_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var item in _functionItems) item.IsSelected = !item.IsSelected;
+        RefreshFunctionList();
+        UpdateFunctionSelectionSummary();
+    }
+
+    // "Add all functions": check every row the VM can realistically take.
+    // The runtime still skips anything that fails translation, so checking
+    // everything is safe - it just widens coverage.
+    private void FunctionAddAll_Click(object sender, RoutedEventArgs e) => SetFunctionSelection(true, true);
+
+    private void FunctionClear_Click(object sender, RoutedEventArgs e) => SetFunctionSelection(false, false);
+
+    private void SetFunctionSelection(bool selected, bool feasibleOnly)
+    {
+        foreach (var item in _functionItems)
+        {
+            if (feasibleOnly && !item.VmFeasible) continue;
+            item.IsSelected = selected;
+        }
+        RefreshFunctionList();
+        UpdateFunctionSelectionSummary();
+    }
+
+    private void FunctionApplyBatch_Click(object sender, RoutedEventArgs e)
+    {
+        var tag = (FunctionBatchModeBox.SelectedItem as ComboBoxItem)?.Tag as string;
+        MarkerProtectionMode mode;
+        if (tag == "skip") mode = MarkerProtectionMode.Skip;
+        else if (tag == "virtualization") mode = MarkerProtectionMode.Virtualization;
+        else if (tag == "ultra") mode = MarkerProtectionMode.Ultra;
+        else mode = MarkerProtectionMode.Inherit;
+        var vm = double.IsNaN(FunctionBatchVmBox.Value) ? 6 : (int)Math.Clamp(FunctionBatchVmBox.Value, 0, 10);
+        var mutation = double.IsNaN(FunctionBatchMutationBox.Value) ? 2 : (int)Math.Clamp(FunctionBatchMutationBox.Value, 0, 3);
+        var lockToActivation = FunctionBatchActivationSwitch.IsOn;
+
+        var applied = 0;
+        foreach (var item in _functionItems.Where(item => item.IsSelected))
+        {
+            item.Mode = mode;
+            item.VmComplexity = vm;
+            item.MutationStrength = mutation;
+            item.LockToActivation = lockToActivation;
+            applied++;
+        }
+        AppendLog(applied == 0
+            ? "批量应用：没有勾选的函数。"
+            : $"批量应用：已更新 {applied} 个勾选函数的保护参数。");
+        UpdateFunctionSelectionSummary();
+        UpdateCapabilitySummary();
+    }
+
+    private void UpdateFunctionSelectionSummary()
+    {
+        if (FunctionSelectionSummary is null) return;
+        var selected = _functionItems.Where(item => item.IsSelected).ToList();
+        if (selected.Count == 0)
+        {
+            FunctionSelectionSummary.Text = "尚未勾选函数。函数级保护与 SDK marker 区域可同时使用。";
+            return;
+        }
+        var feasible = selected.Count(item => item.VmFeasible);
+        var bytes = selected.Sum(item => (long)item.Size);
+        FunctionSelectionSummary.Text =
+            $"已勾选 {selected.Count} 个函数（其中 {feasible} 个满足 VM 前置条件），合计 {FormatSize(bytes)}。" +
+            (feasible < selected.Count
+                ? " 含栈帧或过小的函数会由 VM 运行时自动跳过并保持原生执行。"
+                : string.Empty);
+    }
+
+    private List<ProtectionObjectRule> CollectFunctionRules() =>
+        _functionItems.Where(item => item.IsSelected).Select(item => item.ToRule()).ToList();
+
+    // A saved project carries the checked functions as rules; re-scan the
+    // input and re-apply the selection so a reload round-trips exactly.
+    private void RestoreFunctionSelection(IReadOnlyList<ProtectionObjectRule> rules)
+    {
+        var functionRules = rules
+            .Where(rule => string.Equals(rule.Source, ProductInfo.FunctionSource, StringComparison.Ordinal))
+            .ToList();
+        if (functionRules.Count == 0)
+        {
+            if (_scannedFunctions.Count == 0)
+            {
+                _functionItems.Clear();
+                UpdateFunctionSelectionSummary();
+            }
+            return;
+        }
+
+        ScanFunctionsInto();
+        foreach (var saved in functionRules)
+        {
+            var item = _functionItems.FirstOrDefault(candidate => candidate.Rva == saved.StartRva);
+            if (item is null) continue;
+            item.IsSelected = true;
+            item.Mode = saved.Mode;
+            item.VmComplexity = saved.VmComplexity;
+            item.MutationStrength = saved.MutationStrength;
+            item.LockToActivation = saved.LockToActivation;
+        }
+        RefreshFunctionList();
+        UpdateFunctionSelectionSummary();
+    }
 
     private void UpdateMarkerEditor()
     {
@@ -595,9 +786,12 @@ public sealed partial class ProtectPage : Page
             _virtualFiles.Clear();
             foreach (var item in options.VirtualFiles) _virtualFiles.Add(item);
             MergeMarkerRules(_peSummary?.Markers ?? []);
-            var saved = options.ObjectRules.ToDictionary(rule => (rule.StartRva, rule.EndRva));
+            var saved = options.ObjectRules
+                .GroupBy(rule => (rule.StartRva, rule.EndRva))
+                .ToDictionary(group => group.Key, group => group.First());
             for (var i = 0; i < _markerRules.Count; i++)
                 if (saved.TryGetValue((_markerRules[i].StartRva, _markerRules[i].EndRva), out var rule)) _markerRules[i] = rule;
+            RestoreFunctionSelection(options.ObjectRules);
             VirtualFilesEmptyText.Visibility = _virtualFiles.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         }
         finally { _applyingPreset = false; UpdateMarkerEditor(); UpdateCapabilitySummary(); }

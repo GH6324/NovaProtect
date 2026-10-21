@@ -78,7 +78,7 @@ public static class ProtectionPlanner
             if (options.StripDebugInfo) plan.Skipped.Add("调试目录裁剪（不重写托管 PE）");
             if (options.StripRelocations) plan.Skipped.Add("重定位裁剪（CLR 封装模式不修改原 PE）");
             if (options.StripExports) plan.Skipped.Add("导出裁剪（CLR 封装模式不修改原 PE）");
-            if (vmRequested || mutationRequested) plan.Skipped.Add("marker VM/变异（仅原生 x64 NovaProtect SDK marker）");
+            if (vmRequested || mutationRequested) plan.Skipped.Add("marker VM/变异与函数 VM（仅原生 x64）");
             if (!string.IsNullOrWhiteSpace(options.LicenseKey)) plan.Skipped.Add("运行时许可（CLR 封装启动器尚未接入许可解释器）");
             if (!string.IsNullOrWhiteSpace(options.ActivationBinding)) plan.Skipped.Add("激活/硬件绑定（CLR 封装启动器尚未接入）");
             return plan;
@@ -114,13 +114,19 @@ public static class ProtectionPlanner
             AddEffective(plan, !string.IsNullOrWhiteSpace(options.LicenseKey), "运行时许可");
             AddEffective(plan, !string.IsNullOrWhiteSpace(options.ActivationBinding), "激活/硬件绑定");
 
+            var functionRules = options.ObjectRules
+                .Where(rule => string.Equals(rule.Source, ProductInfo.FunctionSource, StringComparison.Ordinal))
+                .ToList();
+            var functionVm = functionRules.Count(rule => rule.Mode is not MarkerProtectionMode.Skip);
+            if (functionVm > 0 && vmRequested) plan.Effective.Add($"{functionVm} 个扫描函数 VM");
+
             if (vmRequested || mutationRequested)
             {
-                if (target.Markers.Count == 0)
+                if (target.Markers.Count == 0 && functionVm == 0)
                 {
-                    plan.Skipped.Add("函数/区域保护（目标中没有 NovaProtect SDK marker）");
+                    plan.Skipped.Add("函数/区域保护（目标中没有 NovaProtect SDK marker 或勾选函数）");
                 }
-                else
+                else if (target.Markers.Count > 0)
                 {
                     var selectedMarkers = target.Markers.Count(marker =>
                     {
@@ -129,7 +135,7 @@ public static class ProtectionPlanner
                         return rule?.Mode != MarkerProtectionMode.Skip;
                     });
                     if (vmRequested && selectedMarkers > 0) plan.Effective.Add($"{selectedMarkers} 个 marker 区域 VM");
-                    if (vmRequested && selectedMarkers == 0) plan.Skipped.Add("marker VM（所有已发现对象均配置为跳过）");
+                    if (vmRequested && selectedMarkers == 0 && functionVm == 0) plan.Skipped.Add("marker VM（所有已发现对象均配置为跳过）");
                     if (mutationRequested && vmRequested && selectedMarkers > 0) plan.Effective.Add("VM 前置变异");
                     if (mutationRequested && !vmRequested)
                         plan.Skipped.Add("独立原生变异（当前只实现 VM 前置变异）");
@@ -149,6 +155,21 @@ public static class ProtectionPlanner
 
         foreach (var rule in options.ObjectRules)
         {
+            if (string.Equals(rule.Source, ProductInfo.FunctionSource, StringComparison.Ordinal))
+            {
+                // Scanned functions are trusted by their own detector; the
+                // packer re-validates the range and falls back to native code
+                // for anything the VM translator cannot lower.
+                if (!string.Equals(rule.DetectorVersion, ProductInfo.FunctionDetectorVersion, StringComparison.Ordinal))
+                    plan.Conflicts.Add($"函数规则 {rule.Name} 不是受信任的函数扫描来源");
+                if (rule.EndRva <= rule.StartRva)
+                    plan.Conflicts.Add($"函数规则 {rule.Name} 的 RVA 范围无效");
+                if (rule.Mode is MarkerProtectionMode.Virtualization or MarkerProtectionMode.Ultra && !vmRequested)
+                    plan.Conflicts.Add($"函数规则 {rule.Name} 请求 VM，但全局模式未启用虚拟化");
+                if (rule.LockToActivation && string.IsNullOrWhiteSpace(options.ActivationBinding))
+                    plan.Conflicts.Add($"函数规则 {rule.Name} 请求激活锁定，但未配置激活绑定");
+                continue;
+            }
             if (!string.Equals(rule.Source, ProductInfo.MarkerSource, StringComparison.Ordinal) ||
                 !string.Equals(rule.DetectorVersion, ProductInfo.MarkerDetectorVersion, StringComparison.Ordinal))
                 plan.Conflicts.Add($"对象规则 {rule.Name} 不是受信任的 NovaProtect SDK marker 来源");
@@ -175,7 +196,7 @@ public static class ProtectionPlanner
             ProtectionTargetArchitecture.X64 when !target.IsManaged =>
             [
                 new("区段加密", CapabilityState.Supported, "x64 loader 已验证"),
-                new("marker VM/Ultra", CapabilityState.Supported, "仅处理 SDK marker 区域"),
+                new("marker VM/Ultra", CapabilityState.Supported, "处理 SDK marker 区域与扫描函数"),
                 new("导入虚拟化", CapabilityState.Supported, "剥离目录并运行时重建 IAT"),
                 new("许可/激活", CapabilityState.Supported, "x64 保护运行时校验"),
                 new("重定位裁剪", target.IsDll ? CapabilityState.Conflict : CapabilityState.Partial,
