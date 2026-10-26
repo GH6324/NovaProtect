@@ -100,13 +100,10 @@ pwsh -NoProfile -File .\tools\package-github-source.ps1
 
 客户端打包需要 MinGW-w64（`g++`/`gcc`/`ld`/`objcopy`）、Inno Setup 6 或 7、.NET SDK 以及 PHP CLI（用于本地站点 E2E）。**保护引擎源码不在本仓库，因此从本仓库无法构建出完整的保护器**——上述脚本面向拥有完整源码树的维护者。
 
-## 版权
-
-专有软件，保留所有权利。详见 [`LICENSE`](LICENSE)。
 
 - `sdk/` 下的头文件可复制进你与 NovaProtect 配合使用的软件中。
 - `website/` 源码可供已授权部署的运维者安装与维护自有站点。
 
 ## 安全
 
-发现安全问题时请勿公开提交 issue，通过官网联系维护者。
+发现安全问题时请勿提交 issue，或者通过官网联系维护者。
