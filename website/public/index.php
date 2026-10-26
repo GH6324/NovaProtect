@@ -8,6 +8,9 @@ require dirname(__DIR__) . '/app/portal.php';
 $path = rtrim(parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/', '/') ?: '/';
 $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 np_set_common_headers();
+// Preflight on the admin upload transport must be answered, not rejected: a 405
+// here makes the browser abandon the request before the POST is ever sent.
+if ($method === 'OPTIONS' && str_starts_with($path, '/api/admin/release/')) { header('Allow: POST, OPTIONS'); http_response_code(204); exit; }
 set_exception_handler(static function (Throwable $exception) use ($path): void {
     error_log('NovaProtect request failed: ' . get_class($exception));
     if (str_starts_with($path, '/api/') || $path === '/health') np_problem('服务器暂时无法处理请求，请稍后重试。', 500, 'internal_error');
@@ -27,6 +30,11 @@ if (!np_installed() && !in_array($path, ['/install','/install.php'], true)) {
     np_redirect('/install');
 }
 $release = np_client_release();
+
+// Chunked admin upload transport. It lives under /api/ so the CDNfly edge rule
+// (origin pass-through, all challenges off) applies and the WAF never sees a
+// multipart body, a filename or a PE header.
+if (str_starts_with($path, '/api/admin/release/')) np_handle_release_upload_api($path, $method);
 
 if (str_starts_with($path, '/api/')) {
     // Public read-only release metadata and download; no account system exists.

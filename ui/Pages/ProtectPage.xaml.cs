@@ -32,7 +32,6 @@ public sealed partial class ProtectPage : Page
         MarkerList.ItemsSource = _markerRules;
         FunctionList.ItemsSource = _functionItems;
         CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(null);
-        ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(null);
         var initialPreset = PresetBox.SelectedIndex;
         PresetBox.SelectedIndex = -1;
         PresetBox.SelectedIndex = initialPreset;
@@ -101,7 +100,6 @@ public sealed partial class ProtectPage : Page
             PeInfoBar.IsOpen = false;
             UpdateMarkerEditor();
             CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(null);
-            ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(null);
             UpdateCapabilitySummary();
             return;
         }
@@ -118,7 +116,6 @@ public sealed partial class ProtectPage : Page
         PeInfoBar.IsOpen = true;
         MergeMarkerRules(_peSummary.Markers);
         CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(_peSummary);
-        ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(_peSummary);
         UpdateCapabilitySummary();
 
         if (!_settingDefaultOutput && string.IsNullOrWhiteSpace(OutputPathBox.Text))
@@ -354,6 +351,8 @@ public sealed partial class ProtectPage : Page
             },
             MutationStrength = (int)Math.Round(MutationSlider.Value),
             VmComplexity = (int)Math.Round(VmSlider.Value),
+            EnableRevirtualization = RevirtSwitch.IsOn,
+            RevirtualizationLevel = SelectedTag(RevirtLevelBox),
             AntiDebugLevel = SelectedTag(AntiDebugBox),
             AntiVmLevel = SelectedTag(AntiVmBox),
             MemoryProtection = MemoryProtectionSwitch.IsOn,
@@ -473,7 +472,6 @@ public sealed partial class ProtectPage : Page
         _peSummary = PeInspector.Inspect(path);
         MergeMarkerRules(_peSummary.Markers);
         CapabilityMatrixList.ItemsSource = ProtectionPlanner.MatrixFor(_peSummary);
-        ArchitectureMatrixList.ItemsSource = ProtectionPlanner.FullMatrixFor(_peSummary);
         UpdateCapabilitySummary();
     }
 
@@ -767,6 +765,8 @@ public sealed partial class ProtectPage : Page
             ModePicker.SelectedIndex = options.Mode switch { ProtectionMode.Mutation => 0, ProtectionMode.Virtualization => 1, _ => 2 };
             MutationSlider.Value = options.MutationStrength;
             VmSlider.Value = options.VmComplexity;
+            RevirtSwitch.IsOn = options.EnableRevirtualization;
+            SelectTag(RevirtLevelBox, options.RevirtualizationLevel);
             SelectTag(AntiDebugBox, options.AntiDebugLevel);
             SelectTag(AntiVmBox, options.AntiVmLevel);
             MemoryProtectionSwitch.IsOn = options.MemoryProtection;

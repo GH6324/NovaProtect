@@ -419,6 +419,7 @@ function np_admin_login_allowed(): bool
 }
 
 require_once __DIR__ . '/features.php';
+require_once __DIR__ . '/upload.php';
 
 /** Detect PHP-FPM's post_max_size rejection, which empties both form arrays. */
 function np_request_exceeds_post_max_size(): bool

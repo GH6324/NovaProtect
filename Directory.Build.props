@@ -1,9 +1,9 @@
 <Project>
   <PropertyGroup>
-    <Version>2.3.2</Version>
-    <AssemblyVersion>2.3.2.0</AssemblyVersion>
-    <FileVersion>2.3.2.0</FileVersion>
-    <InformationalVersion>2.3.2</InformationalVersion>
+    <Version>2.3.18</Version>
+    <AssemblyVersion>2.3.18.0</AssemblyVersion>
+    <FileVersion>2.3.18.0</FileVersion>
+    <InformationalVersion>2.3.18</InformationalVersion>
     <Product>NovaProtect</Product>
     <Company>NovaProtect</Company>
     <Authors>NovaProtect</Authors>

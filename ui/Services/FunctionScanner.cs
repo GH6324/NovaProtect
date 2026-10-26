@@ -100,6 +100,7 @@ public static class FunctionScanner
             stream.ReadExactly(directories);
             var exportDirRva = BinaryPrimitives.ReadUInt32LittleEndian(directories[0..4]);
             var exceptionDirRva = BinaryPrimitives.ReadUInt32LittleEndian(directories[(3 * 8)..(3 * 8 + 4)]);
+            var exceptionDirSize = BinaryPrimitives.ReadUInt32LittleEndian(directories[(3 * 8 + 4)..(3 * 8 + 8)]);
 
             var sectionCount = BinaryPrimitives.ReadUInt16LittleEndian(header[6..8]);
             var sectionTable = peOffset + 24 + optionalSize;
@@ -128,7 +129,7 @@ public static class FunctionScanner
 
             if (architecture == ProtectionTargetArchitecture.X64 && exceptionDirRva != 0)
             {
-                var (functions, total, skipped) = ScanPdata(stream, sections, exceptionDirRva, exports);
+                var (functions, total, skipped) = ScanPdata(stream, sections, exceptionDirRva, exceptionDirSize, exports);
                 return new FunctionScanResult
                 {
                     Success = true,
@@ -163,17 +164,27 @@ public static class FunctionScanner
 
     // RUNTIME_FUNCTION { DWORD BeginAddress; DWORD EndAddress; DWORD UnwindInfo; }
     private static (List<ScannedFunction>, int, int) ScanPdata(
-        FileStream stream, List<Section> sections, uint exceptionDirRva, Dictionary<uint, string> exports)
+        FileStream stream, List<Section> sections, uint exceptionDirRva, uint exceptionDirSize,
+        Dictionary<uint, string> exports)
     {
         var table = FindSection(sections, exceptionDirRva);
-        if (table is null || table.Value.RawSize < 12)
-            return ([], 0, 0);
+        if (table is null) return ([], 0, 0);
 
-        var entries = checked((int)(table.Value.RawSize / 12));
+        // The exception directory has its own RVA and size inside data
+        // directory #3. Reading it from the section head, or counting with
+        // the section's raw size, pulls in unrelated bytes and reports the
+        // wrong number of routines.
+        var dirOffset = table.Value.RawOffset + (exceptionDirRva - table.Value.VirtualAddress);
+        if (dirOffset < 0 || dirOffset >= stream.Length) return ([], 0, 0);
+        var totalBytes = exceptionDirSize != 0 ? exceptionDirSize : table.Value.RawSize;
+        if (totalBytes > table.Value.RawSize) totalBytes = table.Value.RawSize;
+        var entries = (int)(totalBytes / 12);
+        if (entries <= 0) return ([], 0, 0);
+
         var functions = new List<ScannedFunction>(Math.Min(entries, MaxFunctions));
         var skipped = 0;
-        stream.Position = table.Value.RawOffset;
-        var buffer = new byte[table.Value.RawSize];
+        stream.Position = dirOffset;
+        var buffer = new byte[totalBytes];
         stream.ReadExactly(buffer);
 
         for (var i = 0; i < entries; i++)
@@ -273,23 +284,35 @@ public static class FunctionScanner
         var dir = FindSection(sections, exportDirRva);
         if (dir is null || dir.Value.RawSize < 40) return map;
 
-        stream.Position = dir.Value.RawOffset;
-        var buffer = new byte[dir.Value.RawSize];
+        // The export directory lives at exportDirRva inside its section, so
+        // the table has to be read from that offset - not from the section
+        // head, which may hold unrelated data.
+        var dirOffset = dir.Value.RawOffset + (exportDirRva - dir.Value.VirtualAddress);
+        if (dirOffset < 0 || dirOffset + 40 > stream.Length) return map;
+
+        stream.Position = dirOffset;
+        var buffer = new byte[40];
         stream.ReadExactly(buffer);
         var ordinalBase = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(buffer, 16, 4));
+        var numberOfFunctions = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(buffer, 20, 4));
         var numberOfNames = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(buffer, 24, 4));
         var addressTableRva = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(buffer, 28, 4));
         var nameTableRva = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(buffer, 32, 4));
         var ordinalTableRva = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(buffer, 36, 4));
         if (numberOfNames == 0 || numberOfNames > 65536) return map;
+        if (numberOfFunctions == 0 || numberOfFunctions > 65536) return map;
 
         var nameSection = FindSection(sections, nameTableRva);
         var ordinalSection = FindSection(sections, ordinalTableRva);
         var addressSection = FindSection(sections, addressTableRva);
         if (nameSection is null || ordinalSection is null || addressSection is null) return map;
 
-        // The name-pointer table and the ordinal table are parallel arrays;
-        // each ordinal indexes the export address table (minus the base).
+        // The name-pointer table and the ordinal table are parallel arrays of
+        // NumberOfNames entries; the ordinal table already stores the index
+        // into the export address table, so it must be used as-is. Subtracting
+        // the ordinal base shifts every name onto the neighbouring function
+        // (and drops every name outright once the base exceeds the index,
+        // which is how user32.dll lost all 1024 of its exports).
         stream.Position = nameSection.Value.RawOffset + (nameTableRva - nameSection.Value.VirtualAddress);
         var nameRows = new byte[numberOfNames * 4];
         stream.ReadExactly(nameRows);
@@ -297,8 +320,7 @@ public static class FunctionScanner
         var ordinalRows = new byte[numberOfNames * 2];
         stream.ReadExactly(ordinalRows);
         stream.Position = addressSection.Value.RawOffset + (addressTableRva - addressSection.Value.VirtualAddress);
-        var addressCount = (int)Math.Min((stream.Length - stream.Position) / 4, 65536);
-        var addressRows = new byte[addressCount * 4];
+        var addressRows = new byte[numberOfFunctions * 4];
         stream.ReadExactly(addressRows);
 
         for (var i = 0; i < numberOfNames; i++)
@@ -306,11 +328,17 @@ public static class FunctionScanner
             var nameRva = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(nameRows, i * 4, 4));
             var symbol = ReadCString(stream, sections, nameRva);
             if (string.IsNullOrEmpty(symbol)) continue;
-            var ordinal = BinaryPrimitives.ReadUInt16LittleEndian(new ReadOnlySpan<byte>(ordinalRows, i * 2, 2));
-            var index = ordinal - ordinalBase;
-            if (index < 0 || index >= addressCount) continue;
-            var functionRva = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(addressRows, (int)index * 4, 4));
-            if (functionRva != 0) map[functionRva] = symbol;
+            var eatIndex = BinaryPrimitives.ReadUInt16LittleEndian(new ReadOnlySpan<byte>(ordinalRows, i * 2, 2));
+            if (eatIndex >= numberOfFunctions) continue;
+            var functionRva = BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(addressRows, (int)eatIndex * 4, 4));
+            if (functionRva == 0) continue;
+            // A forwarder points into the export directory rather than at
+            // code, so it has no function body to protect.
+            if (functionRva >= exportDirRva && functionRva < exportDirRva + 0x10000) continue;
+            // Two names may alias the same entry (for example the ANSI and
+            // Unicode spellings of one API). Keep the first one so the list
+            // stays stable and every row still carries a distinct label.
+            if (!map.ContainsKey(functionRva)) map[functionRva] = symbol;
         }
         return map;
     }

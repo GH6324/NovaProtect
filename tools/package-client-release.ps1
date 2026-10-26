@@ -62,12 +62,17 @@ foreach ($required in @(
 
 # ------------------------------------------------------------- Inno Setup ---
 $iscc = $null
+# Per-user installs (the winget/unpacked default on this machine) live under
+# LOCALAPPDATA, so the Program Files probes alone miss a perfectly good ISCC.
 foreach ($candidate in @(
     (Join-Path ${env:ProgramFiles} 'Inno Setup 7\ISCC.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7\ISCC.exe'),
-    (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe')
+    (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+    (Join-Path ${env:ProgramFiles} 'Inno Setup 6\ISCC.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
   )) {
-  if (Test-Path -LiteralPath $candidate) { $iscc = $candidate; break }
+  if ($candidate -and (Test-Path -LiteralPath $candidate)) { $iscc = $candidate; break }
 }
 if (-not $iscc) { $command = Get-Command iscc -ErrorAction SilentlyContinue; if ($command) { $iscc = $command.Source } }
 if (-not $iscc) { throw 'Inno Setup compiler (ISCC.exe) not found; install Inno Setup 6/7 or add ISCC to PATH.' }

@@ -22,6 +22,7 @@ public enum MarkerProtectionMode
     Inherit,
     Skip,
     Virtualization,
+    Mutation,
     Ultra
 }
 
@@ -76,6 +77,19 @@ public sealed class ProtectionOptions
     public ProtectionMode Mode { get; set; } = ProtectionMode.Ultra;
     public int MutationStrength { get; set; } = 2;
     public int VmComplexity { get; set; } = 6;
+    /// <summary>
+    /// Themida-style second-level virtualization. Each virtualized region is
+    /// split into stages with independent opcode permutations and keys, and its
+    /// straight-line arithmetic runs execute in a separate guest interpreter
+    /// with a permuted register file.
+    /// </summary>
+    public bool EnableRevirtualization { get; set; } = true;
+    /// <summary>
+    /// Requested nesting level, 0-4. Level 0 is equivalent to disabling the
+    /// feature; level 1 is what the engine currently implements. Higher values
+    /// are accepted and reported rather than silently treated as level 1.
+    /// </summary>
+    public int RevirtualizationLevel { get; set; } = 1;
     public int AntiDebugLevel { get; set; } = 2;
     public int AntiVmLevel { get; set; }
     public bool MemoryProtection { get; set; }
@@ -139,13 +153,6 @@ public sealed class BuildPlan
 
 public sealed record CapabilityCell(string Name, CapabilityState State, string Detail);
 
-public sealed record ArchitectureCapabilityRow(
-    string Capability,
-    string X86,
-    string X64,
-    string Arm64,
-    string DotNet,
-    string Detail);
 
 public sealed record PeSummary(
     bool IsValid,

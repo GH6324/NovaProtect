@@ -7,7 +7,7 @@
     mc:Ignorable="d">
 
     <Grid>
-        <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <ScrollViewer x:Name="PageScroll" VerticalScrollBarVisibility="Auto">
             <StackPanel Padding="{StaticResource PagePadding}" Spacing="16" MaxWidth="1080" HorizontalAlignment="Stretch">
                 <Grid>
                     <Grid.ColumnDefinitions>
@@ -142,6 +142,25 @@
                                         ValueChanged="VmSlider_ValueChanged" />
                             </StackPanel>
                         </Grid>
+                        <Grid ColumnSpacing="16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" /><ColumnDefinition Width="150" />
+                                <ColumnDefinition Width="*" /><ColumnDefinition Width="150" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="二次虚拟化" VerticalAlignment="Center"
+                                       ToolTipService.ToolTip="阶段拆分 + 二级解释器 + 寄存器重映射；仅 x64 生效" />
+                            <ToggleSwitch x:Name="RevirtSwitch" Grid.Column="1" IsOn="True"
+                                          OnContent="开启" OffContent="关闭" />
+                            <TextBlock Grid.Column="2" Text="嵌套层级" VerticalAlignment="Center" Margin="16,0,0,0" />
+                            <ComboBox x:Name="RevirtLevelBox" Grid.Column="3" SelectedIndex="1"
+                                      HorizontalAlignment="Stretch">
+                                <ComboBoxItem Content="0" Tag="0" />
+                                <ComboBoxItem Content="1" Tag="1" />
+                                <ComboBoxItem Content="2" Tag="2" />
+                                <ComboBoxItem Content="3" Tag="3" />
+                                <ComboBoxItem Content="4" Tag="4" />
+                            </ComboBox>
+                        </Grid>
                     </StackPanel>
                 </Border>
 
@@ -176,7 +195,7 @@
                             <ToggleSwitch x:Name="MemoryProtectionSwitch" Header="内存完整性保护" />
                             <ToggleSwitch x:Name="ImportProtectionSwitch" Header="导入表保护" />
                             <ToggleSwitch x:Name="ResourceProtectionSwitch" Header="资源区段保护" />
-                            <ToggleSwitch x:Name="SandboxGuardSwitch" Header="反沙箱检测（重点反微步云沙箱）" />
+                            <ToggleSwitch x:Name="SandboxGuardSwitch" Header="沙箱环境检测" />
                             <ToggleSwitch x:Name="AntiDumpSwitch" Header="反内存转储" />
                             <ToggleSwitch x:Name="EnvCheckSwitch" Header="交互桌面环境自检" />
                             <TextBlock Text="资源区段加密时会保留程序图标，加密后资源管理器中显示的图标与原文件一致。"
@@ -336,10 +355,11 @@
                                             <Grid ColumnSpacing="10" Padding="2,5">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="Auto" />
-                                                    <ColumnDefinition Width="200" />
+                                                    <ColumnDefinition Width="180" />
                                                     <ColumnDefinition Width="150" />
                                                     <ColumnDefinition Width="70" />
                                                     <ColumnDefinition Width="60" />
+                                                    <ColumnDefinition Width="130" />
                                                     <ColumnDefinition Width="*" />
                                                 </Grid.ColumnDefinitions>
                                                 <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay}" VerticalAlignment="Center" />
@@ -351,7 +371,12 @@
                                                            FontSize="12" />
                                                 <TextBlock Grid.Column="4" Text="{Binding Size}" VerticalAlignment="Center"
                                                            FontSize="12" />
-                                                <TextBlock Grid.Column="5" Text="{Binding Feasibility}" VerticalAlignment="Center"
+                                                <ComboBox Grid.Column="5" FontSize="12" MinWidth="110"
+                                                          HorizontalAlignment="Left" VerticalAlignment="Center"
+                                                          ItemsSource="{Binding ModeOptions}"
+                                                          DisplayMemberPath="Label"
+                                                          SelectedItem="{Binding SelectedOption, Mode=TwoWay}" />
+                                                <TextBlock Grid.Column="6" Text="{Binding Feasibility}" VerticalAlignment="Center"
                                                            FontSize="12" Opacity="0.8" />
                                             </Grid>
                                         </DataTemplate>
@@ -420,60 +445,6 @@
                                 </DataTemplate>
                             </ListView.ItemTemplate>
                         </ListView>
-                    </StackPanel>
-                </Border>
-
-                <Border Style="{StaticResource CardStyle}">
-                    <StackPanel Spacing="12">
-                        <StackPanel>
-                            <TextBlock Text="完整架构能力矩阵" Style="{StaticResource SectionTitleStyle}" />
-                            <TextBlock Text="横向对照 x86、x64、ARM64 与 .NET；原生 EXE/DLL 的裁剪差异在说明列中明确列出。"
-                                       Style="{StaticResource SubtleTextStyle}" FontSize="12" />
-                        </StackPanel>
-                        <ScrollViewer HorizontalScrollBarVisibility="Auto" HorizontalScrollMode="Enabled">
-                            <StackPanel MinWidth="1040">
-                                <Grid ColumnSpacing="10" Padding="4,6">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="180" />
-                                            <ColumnDefinition Width="120" />
-                                            <ColumnDefinition Width="120" />
-                                            <ColumnDefinition Width="120" />
-                                            <ColumnDefinition Width="120" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="能力" FontWeight="SemiBold" />
-                                        <TextBlock Grid.Column="1" Text="x86 原生" FontWeight="SemiBold" />
-                                        <TextBlock Grid.Column="2" Text="x64 原生" FontWeight="SemiBold" />
-                                        <TextBlock Grid.Column="3" Text="ARM64" FontWeight="SemiBold" />
-                                        <TextBlock Grid.Column="4" Text=".NET" FontWeight="SemiBold" />
-                                        <TextBlock Grid.Column="5" Text="事实与边界" FontWeight="SemiBold" />
-                                </Grid>
-                                <ItemsControl x:Name="ArchitectureMatrixList">
-                                <ItemsControl.ItemTemplate>
-                                    <DataTemplate>
-                                        <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,0,1">
-                                        <Grid ColumnSpacing="10" Padding="4,7">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="180" />
-                                                <ColumnDefinition Width="120" />
-                                                <ColumnDefinition Width="120" />
-                                                <ColumnDefinition Width="120" />
-                                                <ColumnDefinition Width="120" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock Text="{Binding Capability}" FontWeight="SemiBold" TextWrapping="Wrap" />
-                                            <TextBlock Grid.Column="1" Text="{Binding X86}" TextWrapping="Wrap" />
-                                            <TextBlock Grid.Column="2" Text="{Binding X64}" TextWrapping="Wrap" />
-                                            <TextBlock Grid.Column="3" Text="{Binding Arm64}" TextWrapping="Wrap" />
-                                            <TextBlock Grid.Column="4" Text="{Binding DotNet}" TextWrapping="Wrap" />
-                                            <TextBlock Grid.Column="5" Text="{Binding Detail}" TextWrapping="Wrap" />
-                                        </Grid>
-                                        </Border>
-                                    </DataTemplate>
-                                </ItemsControl.ItemTemplate>
-                                </ItemsControl>
-                            </StackPanel>
-                        </ScrollViewer>
                     </StackPanel>
                 </Border>
 

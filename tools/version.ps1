@@ -79,7 +79,7 @@ function Sync-Version([version]$version) {
   # 30 characters or the website release notes lose their tail.
   Write-Utf8 (Join-Path $root 'installer\version.iss') @"
 #define MyAppVersion "$text"
-#define MyAppVersionComments "修复反沙箱拦截崩溃；强化运行时稳定性"
+#define MyAppVersionComments "二次虚拟化多层嵌套"
 "@
 
   $websiteVersionPath = Join-Path $root 'website\VERSION'

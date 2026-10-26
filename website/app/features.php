@@ -320,12 +320,24 @@ function np_upload_client_release(array $file, string $minimumVersion, bool $for
     $temporary = $file['tmp_name'] ?? '';
     $originalName = is_string($file['name'] ?? null) ? basename(str_replace('\\', '/', $file['name'])) : '';
     if (!is_string($temporary) || !is_uploaded_file($temporary)) throw new InvalidArgumentException('上传临时文件无效。');
-    if (!preg_match('/\.exe$/iD', $originalName)) throw new InvalidArgumentException('只支持客户端 EXE 安装包；请选择 .exe 文件。');
+    return np_publish_client_release($temporary, $originalName, $minimumVersion, $forceUpdate, $releaseNotes, $actorId, true);
+}
+
+/**
+ * Validate and publish an installer that already exists on the server.
+ *
+ * $originalName may be empty: the chunked transport never learns the browser
+ * filename, so the canonical name is rebuilt from the PE version resource.
+ */
+function np_publish_client_release(string $temporary, string $originalName, string $minimumVersion, bool $forceUpdate, string $releaseNotes, string $actorId, bool $fromUpload = false): array
+{
+    if (!is_file($temporary)) throw new InvalidArgumentException('待发布的安装包不存在。');
+    if ($originalName !== '' && !preg_match('/\.exe$/iD', $originalName)) throw new InvalidArgumentException('只支持客户端 EXE 安装包；请选择 .exe 文件。');
     $size = filesize($temporary);
     if ($size === false || $size < 1 || $size > 268435456) throw new InvalidArgumentException('客户端安装包大小必须在 1 字节到 256 MB 之间。');
     if (!np_pe_is_executable($temporary)) throw new InvalidArgumentException('上传文件不是有效的 Windows PE EXE；请上传客户端安装包。');
     $nameVersion = null;
-    if (preg_match('/^NovaProtect-Setup-(\d+\.\d+\.\d+)\.exe$/iD', $originalName, $match)) $nameVersion = $match[1];
+    if ($originalName !== '' && preg_match('/^NovaProtect-Setup-(\d+\.\d+\.\d+)\.exe$/iD', $originalName, $match)) $nameVersion = $match[1];
     $peVersion = np_pe_file_version($temporary);
     if ($peVersion === null) throw new InvalidArgumentException('无法从 EXE 的 PE 版本资源识别客户端版本；请上传正式客户端安装包。');
     if ($nameVersion !== null && $peVersion !== $nameVersion) throw new InvalidArgumentException("文件名版本 {$nameVersion} 与 EXE 版本 {$peVersion} 不一致，请上传同一版本的安装包。");
@@ -337,7 +349,7 @@ function np_upload_client_release(array $file, string $minimumVersion, bool $for
     $minimumVersion = trim($minimumVersion);
     if (!preg_match('/^\d+\.\d+\.\d+$/D', $minimumVersion) || version_compare($minimumVersion, $fileVersion, '>')) throw new InvalidArgumentException('最低可用版本必须是不高于发布版本的三段版本号。');
     $notes = trim($releaseNotes) === ''
-        ? (np_pe_file_comments($temporary) ?? np_default_client_release_notes($fileVersion))
+        ? np_auto_client_release_notes($temporary, $fileVersion, (int) $size)
         : np_text($releaseNotes, 12000, '更新说明', false);
     $current = np_client_release();
     $currentVersion = (string) ($current['clientVersion'] ?? '');
@@ -348,7 +360,11 @@ function np_upload_client_release(array $file, string $minimumVersion, bool $for
     $target = rtrim($directory, '/\\') . '/' . $targetName;
     if (is_file($target)) throw new InvalidArgumentException('该客户端版本已经上传过。');
     $temporaryTarget = $target . '.' . bin2hex(random_bytes(8)) . '.upload';
-    if (!move_uploaded_file($temporary, $temporaryTarget)) throw new RuntimeException('无法保存客户端安装包。');
+    $stored = $fromUpload ? @move_uploaded_file($temporary, $temporaryTarget) : @rename($temporary, $temporaryTarget);
+    if (!$stored) {
+        if ($fromUpload || !@copy($temporary, $temporaryTarget)) throw new RuntimeException('无法保存客户端安装包。');
+        @unlink($temporary);
+    }
     try {
         chmod($temporaryTarget, 0640);
         $sha256 = hash_file('sha256', $temporaryTarget);
@@ -382,7 +398,16 @@ function np_upload_client_release(array $file, string $minimumVersion, bool $for
     }
 }
 
-function np_default_client_release_notes(string $version): string
+/**
+ * Build the changelog entry without asking the administrator to type anything.
+ *
+ * Priority: an explicit catalog shipped next to the website wins, otherwise the
+ * summary embedded in the installer's version resource is expanded into a
+ * structured entry. The summary is the same string the build writes into
+ * VersionInfoDescription ("NovaProtect Client Installer - <summary>"), so the
+ * changelog always matches the binary that was actually uploaded.
+ */
+function np_auto_client_release_notes(string $installerPath, string $version, int $size): string
 {
     $catalogPath = NP_ROOT . '/client-release-notes.json';
     if (is_file($catalogPath)) {
@@ -394,7 +419,23 @@ function np_default_client_release_notes(string $version): string
             error_log('NovaProtect release notes catalog ignored: ' . get_class($exception));
         }
     }
-    return "NovaProtect 客户端 {$version}\n- 改进在线更新与后台发布流程。";
+    return np_compose_client_release_notes($version, np_pe_file_comments($installerPath), $size);
+}
+
+/** Turn the one-line installer summary into a multi-line changelog entry. */
+function np_compose_client_release_notes(string $version, ?string $summary, int $size): string
+{
+    $items = [];
+    if (is_string($summary) && trim($summary) !== '') {
+        foreach (preg_split('/[；;]+/u', $summary) ?: [] as $item) {
+            $item = trim((string) preg_replace('/^[\s\-*·•]+/u', '', $item));
+            if ($item !== '') $items[] = $item;
+        }
+    }
+    if (!$items) $items[] = '改进在线更新与后台发布流程';
+    $lines = ['NovaProtect 客户端 ' . $version . '（Windows x64 · ' . np_format_bytes($size) . '）'];
+    foreach ($items as $item) $lines[] = '- ' . $item;
+    return implode("\n", $lines);
 }
 
 function np_audit(string $actor, string $action, array $metadata = []): void
@@ -517,13 +558,16 @@ function np_upgrade_zip_entry_hash(\ZipArchive $zip, string $name, int $index): 
     return hash_final($context);
 }
 
-function np_upgrade_validate_archive(string $archive, string $originalName): array
+function np_upgrade_validate_archive(string $archive, ?string $originalName = null): array
 {
     if (!class_exists('ZipArchive')) throw new InvalidArgumentException('服务器缺少 PHP Zip 扩展，无法校验升级包。');
     if (!is_file($archive) || !is_readable($archive)) throw new InvalidArgumentException('升级包临时文件不可读。');
     $size = filesize($archive);
     if ($size === false || $size < 1 || $size > 268435456) throw new InvalidArgumentException('升级包大小必须在 1 字节到 256 MB 之间。');
-    if (strtolower(pathinfo($originalName, PATHINFO_EXTENSION)) !== 'zip') throw new InvalidArgumentException('只能上传 ZIP 升级包。');
+    // The chunked transport never learns the browser filename; the archive
+    // itself is proof enough, because ZipArchive::open rejects anything that is
+    // not a readable ZIP.
+    if (is_string($originalName) && $originalName !== '' && strtolower(pathinfo($originalName, PATHINFO_EXTENSION)) !== 'zip') throw new InvalidArgumentException('只能上传 ZIP 升级包。');
 
     $zip = new \ZipArchive();
     if ($zip->open($archive) !== true) throw new InvalidArgumentException('ZIP 文件无法打开或已损坏。');
@@ -553,20 +597,27 @@ function np_upgrade_validate_archive(string $archive, string $originalName): arr
 
         $required = [
             'SHA256SUMS', 'VERSION', 'release.json', 'package.json', 'README.md', 'upgrade.sh',
-            'app/bootstrap.php', 'app/features.php', 'app/site.php', 'app/portal.php', 'app/view.php', 'app/version.json', 'public/index.php', 'public/.user.ini',
+            'app/bootstrap.php', 'app/features.php', 'app/upload.php', 'app/site.php', 'app/portal.php', 'app/view.php', 'app/version.json', 'public/index.php', 'public/.user.ini',
             'public/css/site.css', 'public/js/upload-progress.js', 'public/assets/novaprotect.png', 'public/favicon.ico',
             'deploy/upgrade.sh', 'deploy/migrate.php', 'deploy/rollback.sh', 'deploy/health-check.sh', 'deploy/upgrade-executor.sh', 'deploy/novaprotect-upgrade-executor.service', 'deploy/novaprotect-upgrade-executor.timer',
             'deploy/cdnfly-edge-policy.json', 'deploy/cdnfly-check.sh', 'deploy/CDNFLY.md',
         ];
         foreach ($required as $name) if (!isset($entries[$name])) throw new InvalidArgumentException('升级包缺少文件：' . $name);
-        foreach (['install.sh', 'deploy/install.sh', 'deploy/entry-install.sh', 'deploy/configure_nginx.py', 'deploy/nginx-location.conf'] as $forbidden) {
+        // Only the full-install entry points are forbidden. configure_nginx.py
+        // and nginx-location.conf must stay allowed: deploy/upgrade.sh requires
+        // them, and tools/package-website.ps1 ships both in the upgrade bundle.
+        foreach (['install.sh', 'deploy/install.sh', 'deploy/entry-install.sh'] as $forbidden) {
             if (isset($entries[$forbidden])) throw new InvalidArgumentException('升级包不能包含完整安装入口：' . $forbidden);
         }
 
         $metadata = json_decode(np_upgrade_zip_entry_content($zip, 'package.json', $entries['package.json'], 1048576), true, 32, JSON_THROW_ON_ERROR);
         if (!is_array($metadata) || ($metadata['product'] ?? '') !== 'NovaProtect' || ($metadata['packageType'] ?? '') !== 'upgrade') throw new InvalidArgumentException('package.json 不是 NovaProtect 离线升级包。');
         if (($metadata['purpose'] ?? '') !== 'offline-upgrade') throw new InvalidArgumentException('package.json 升级用途无效。');
+        // PowerShell's ConvertTo-Json collapses a one-element array into a
+        // scalar, so accept both shapes; the contract is still "exactly one
+        // entry point, and it is upgrade.sh".
         $entryPoints = $metadata['entryPoints'] ?? [];
+        if (is_string($entryPoints)) $entryPoints = [$entryPoints];
         if (!is_array($entryPoints) || $entryPoints !== ['upgrade.sh']) throw new InvalidArgumentException('升级包入口不符合精简包要求。');
 
         $version = trim(np_upgrade_zip_entry_content($zip, 'VERSION', $entries['VERSION'], 128));
@@ -578,8 +629,11 @@ function np_upgrade_validate_archive(string $archive, string $originalName): arr
         $clientFile = (string) ($release['fileName'] ?? '');
         $clientHash = strtolower((string) ($release['sha256'] ?? ''));
         if (!preg_match('/^NovaProtect-Setup-\d+\.\d+\.\d+\.exe$/D', $clientFile) || !preg_match('/^[a-f0-9]{64}$/D', $clientHash)) throw new InvalidArgumentException('release.json 客户端发布信息无效。');
+        // The client installer is optional in an upgrade archive: slim packages
+        // reuse the copy already in the server's download store, and
+        // deploy/upgrade.sh re-verifies it against release.json before use.
         $downloadEntry = 'downloads/' . $clientFile;
-        if (!isset($entries[$downloadEntry]) || np_upgrade_zip_entry_hash($zip, $downloadEntry, $entries[$downloadEntry]) !== $clientHash) throw new InvalidArgumentException('客户端安装包 SHA-256 与 release.json 不一致。');
+        if (isset($entries[$downloadEntry]) && np_upgrade_zip_entry_hash($zip, $downloadEntry, $entries[$downloadEntry]) !== $clientHash) throw new InvalidArgumentException('客户端安装包 SHA-256 与 release.json 不一致。');
 
         $manifest = np_upgrade_zip_entry_content($zip, 'SHA256SUMS', $entries['SHA256SUMS'], 4194304);
         $manifestNames = [];
@@ -613,6 +667,12 @@ function np_upload_upgrade_package(array $file, string $actorId): array
     $temporary = $file['tmp_name'] ?? '';
     $originalName = is_string($file['name'] ?? null) ? basename(str_replace('\\', '/', $file['name'])) : '';
     if (!is_string($temporary) || !is_uploaded_file($temporary)) throw new InvalidArgumentException('上传临时文件无效。');
+    return np_publish_upgrade_package($temporary, $originalName, $actorId, true);
+}
+
+/** Validate and store an offline upgrade archive that already sits on disk. */
+function np_publish_upgrade_package(string $temporary, string $originalName, string $actorId, bool $fromUpload = false): array
+{
     $validated = np_upgrade_validate_archive($temporary, $originalName);
     $id = np_uuid();
     $directory = np_upgrade_store_dir() . '/' . $validated['websiteVersion'] . '/' . $id;
@@ -620,7 +680,11 @@ function np_upload_upgrade_package(array $file, string $actorId): array
     if (!mkdir($staging, 0700, true) && !is_dir($staging)) throw new RuntimeException('无法创建升级包存储目录。');
     $archive = $directory . '/NovaProtect-Website-' . $validated['websiteVersion'] . '-Offline.zip';
     try {
-        if (!move_uploaded_file($temporary, $archive)) throw new RuntimeException('无法保存升级包。');
+        $stored = $fromUpload ? @move_uploaded_file($temporary, $archive) : @rename($temporary, $archive);
+        if (!$stored) {
+            if ($fromUpload || !@copy($temporary, $archive)) throw new RuntimeException('无法保存升级包。');
+            @unlink($temporary);
+        }
         chmod($archive, 0600);
         $zip = new \ZipArchive();
         if ($zip->open($archive) !== true || !$zip->extractTo($staging)) throw new RuntimeException('无法展开已校验的升级包。');
@@ -630,7 +694,7 @@ function np_upload_upgrade_package(array $file, string $actorId): array
             if ($item->isLink()) throw new RuntimeException('升级包展开后检测到符号链接。');
             chmod($item->getPathname(), $item->isDir() ? 0700 : 0600);
         }
-        $record = ['id' => $id, 'websiteVersion' => $validated['websiteVersion'], 'clientVersion' => $validated['clientVersion'], 'fileName' => $validated['fileName'], 'originalName' => $originalName, 'size' => $validated['size'], 'sha256' => $validated['sha256'], 'fileCount' => $validated['fileCount'], 'archivePath' => $archive, 'stagingPath' => $staging, 'status' => 'validated', 'uploadedAt' => gmdate('c'), 'uploadedBy' => $actorId];
+        $record = ['id' => $id, 'websiteVersion' => $validated['websiteVersion'], 'clientVersion' => $validated['clientVersion'], 'fileName' => $validated['fileName'], 'originalName' => $originalName !== '' ? $originalName : $validated['fileName'], 'size' => $validated['size'], 'sha256' => $validated['sha256'], 'fileCount' => $validated['fileCount'], 'archivePath' => $archive, 'stagingPath' => $staging, 'status' => 'validated', 'uploadedAt' => gmdate('c'), 'uploadedBy' => $actorId];
         np_transaction('upgrade_packages', static function ($path) use ($record): void {
             $rows = np_upgrade_packages();
             foreach ($rows as $existing) if (($existing['websiteVersion'] ?? '') === $record['websiteVersion'] && ($existing['status'] ?? '') === 'validated') throw new InvalidArgumentException('该网站版本已经上传过升级包。');

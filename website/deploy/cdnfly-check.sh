@@ -106,6 +106,10 @@ check_install_route() {
 
 check_response health /health GET '200'
 check_response admin_login /admin/login GET '200 302'
+# The admin installer upload uses this JSON endpoint for every request. A 401
+# here means the edge passed the POST through to PHP; a 403/444/HTML challenge
+# would mean the WAF still intercepts the upload path.
+check_response upload_begin /api/admin/release/begin POST '401 400 422' '{"size":1}'
 check_install_route
 check_response stylesheet /css/site.css GET '200'
 check_response favicon /favicon.ico GET '200'

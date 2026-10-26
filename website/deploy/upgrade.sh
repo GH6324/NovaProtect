@@ -9,10 +9,12 @@ fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bundle=$(cd -- "$script_dir/.." && pwd)
-for required in VERSION SHA256SUMS release.json app/bootstrap.php app/features.php app/version.json public/index.php public/.user.ini deploy/migrate.php deploy/reset-admin-password.php deploy/health-check.sh deploy/upgrade-executor.sh deploy/novaprotect-upgrade-executor.service deploy/novaprotect-upgrade-executor.timer deploy/configure_nginx.py deploy/nginx-location.conf deploy/cdnfly-edge-policy.json deploy/cdnfly-check.sh deploy/CDNFLY.md; do
+for required in VERSION SHA256SUMS release.json app/bootstrap.php app/features.php app/upload.php app/version.json public/index.php public/.user.ini deploy/migrate.php deploy/reset-admin-password.php deploy/health-check.sh deploy/upgrade-executor.sh deploy/novaprotect-upgrade-executor.service deploy/novaprotect-upgrade-executor.timer deploy/configure_nginx.py deploy/nginx-location.conf deploy/cdnfly-edge-policy.json deploy/cdnfly-check.sh deploy/CDNFLY.md; do
     [[ -f $bundle/$required ]] || { echo "升级包不完整，缺少：$bundle/$required" >&2; exit 1; }
 done
-[[ -d $bundle/downloads ]] || { echo "升级包不完整，缺少：$bundle/downloads" >&2; exit 1; }
+# downloads/ is optional: slim upgrade archives reuse the client installer that
+# is already in the server's download store. The installer is resolved and
+# hash-checked further down.
 
 version=$(tr -d '\r\n' < "$bundle/VERSION")
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid website VERSION: $version" >&2; exit 1; }
@@ -148,8 +150,21 @@ release_site_version=$("$php" -r '$v=json_decode(file_get_contents($argv[1]), tr
 [[ $release_name =~ ^NovaProtect-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe$ ]] || { echo 'release.json 的安装包文件名无效。' >&2; exit 1; }
 [[ $release_hash =~ ^[a-f0-9]{64}$ ]] || { echo 'release.json 的安装包 SHA-256 无效。' >&2; exit 1; }
 installer="$bundle/downloads/$release_name"
-[[ -f $installer ]] || { echo "缺少客户端安装包：$installer" >&2; exit 1; }
-[[ $(sha256sum "$installer" | awk '{print tolower($1)}') == "$release_hash" ]] || { echo '客户端安装包 SHA-256 与 release.json 不一致。' >&2; exit 1; }
+if [[ -f $installer ]]; then
+    [[ $(sha256sum "$installer" | awk '{print tolower($1)}') == "$release_hash" ]] || { echo '客户端安装包 SHA-256 与 release.json 不一致。' >&2; exit 1; }
+    installer_is_bundled=1
+else
+    # Slim upgrade archives omit the client installer (it is tens of megabytes
+    # and already in the download store). Fall back to the copy on this server
+    # and verify it against release.json before touching the live tree.
+    installer="$downloads/$release_name"
+    if [[ ! -f $installer ]]; then
+        echo "升级包不含客户端安装包，服务器上也没有 $release_name；请先发布该客户端或改用完整包升级。" >&2
+        exit 1
+    fi
+    [[ $(sha256sum "$installer" | awk '{print tolower($1)}') == "$release_hash" ]] || { echo "服务器上的 $release_name 与 release.json 的 SHA-256 不一致，拒绝升级。" >&2; exit 1; }
+    installer_is_bundled=0
+fi
 
 mkdir -p "$base/releases" "$state/backups" "$downloads" "$updates" "$state/bin"
 # The site tree (<base>/current -> releases/<version>) lives outside the state
@@ -235,8 +250,10 @@ mv -- "$stage" "$release"
 chown -R root:root "$release"
 find "$release" -type d -exec chmod 0755 {} +
 find "$release" -type f -exec chmod 0644 {} +
-install -m 0644 "$installer" "$downloads/$release_name"
-chown www:www "$downloads/$release_name" 2>/dev/null || true
+if [[ $installer_is_bundled == 1 ]]; then
+    install -m 0644 "$installer" "$downloads/$release_name"
+    chown www:www "$downloads/$release_name" 2>/dev/null || true
+fi
 install -m 0750 -o root -g root "$bundle/deploy/upgrade-executor.sh" "$state/bin/upgrade-executor.sh"
 install -m 0644 -o root -g root "$bundle/deploy/novaprotect-upgrade-executor.service" "$executor_service"
 install -m 0644 -o root -g root "$bundle/deploy/novaprotect-upgrade-executor.timer" "$executor_timer"

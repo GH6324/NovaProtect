@@ -1,9 +1,9 @@
 <?php
 declare(strict_types=1);
 
-function np_form_start(string $action, bool $admin = false, bool $multipart = false, bool $uploadProgress = false): string
+function np_form_start(string $action, bool $admin = false, bool $multipart = false, bool $uploadProgress = false, string $attributes = ''): string
 {
-    $html = '<form method="post" class="stack-form"' . ($multipart ? ' enctype="multipart/form-data"' : '') . ($uploadProgress ? ' data-upload-progress-form' : '') . '>' . np_hidden_csrf() . '<input type="hidden" name="action" value="' . np_e($action) . '">';
+    $html = '<form method="post" class="stack-form"' . ($multipart ? ' enctype="multipart/form-data"' : '') . ($uploadProgress ? ' data-upload-progress-form' : '') . ($attributes !== '' ? ' ' . $attributes : '') . '>' . np_hidden_csrf() . '<input type="hidden" name="action" value="' . np_e($action) . '">';
     if ($admin) {
         $id = np_uuid();
         $_SESSION['admin_ops'][$id] = false;
@@ -61,7 +61,8 @@ function np_admin_post(string $tab): never
 function np_admin_upgrades(): string
 {
     $rows = np_upgrade_packages();
-    $html = '<section class="surface admin-panel"><h2>上传网站离线升级包</h2><p>仅上传 NovaProtect 生成的精简升级 ZIP。系统会校验网站版本、SHA-256 清单、客户端安装包哈希和升级包布局；上传后可直接提交给服务器 root 升级执行器。</p>' . np_form_start('upgrade-upload', true, true, true) . '<div class="field"><label>精简升级 ZIP<input type="file" name="upgrade_package" accept=".zip,application/zip" required></label><small>建议使用 artifacts/website-upgrade/&lt;版本&gt; 下的 ZIP，单包最大 256 MB。</small></div>' . np_upload_progress() . '<button class="button button-primary" type="submit" data-upload-submit>上传并校验升级包</button></form></section>';
+    $chunkAttributes = 'data-chunked-upload="1" data-upload-kind="upgrade" data-upload-begin="/api/admin/release/begin" data-upload-chunk="/api/admin/release/chunk" data-upload-finish="/api/admin/release/finish" data-upload-abort="/api/admin/release/abort" data-upload-redirect="/admin?tab=upgrades" data-upload-token="' . np_e(np_csrf_token()) . '"';
+    $html = '<section class="surface admin-panel"><h2>上传网站离线升级包</h2><p>仅上传 NovaProtect 生成的精简升级 ZIP。系统会校验网站版本、SHA-256 清单、客户端安装包哈希和升级包布局；上传后可直接提交给服务器 root 升级执行器。文件同样按 512 KB 分片经 /api/ 通道上传，不触发 WAF。</p>' . np_form_start('upgrade-upload', true, true, true, $chunkAttributes) . '<div class="field"><label>精简升级 ZIP<input type="file" name="upgrade_package" accept=".zip,application/zip" required></label><small>建议使用 artifacts/website-upgrade/&lt;版本&gt; 下的 ZIP，单包最大 256 MB。</small></div>' . np_upload_progress() . '<button class="button button-primary" type="submit" data-upload-submit>上传并校验升级包</button></form></section>';
     $html .= '<section class="surface admin-panel"><h2>已上传升级包</h2><div class="table-scroll"><table><caption>离线升级包记录</caption><thead><tr><th>网站版本</th><th>状态</th><th>文件</th><th>大小</th><th>SHA-256</th><th>上传时间</th><th>操作</th></tr></thead><tbody>';
     foreach ($rows as $row) {
         $path = is_string($row['stagingPath'] ?? null) ? $row['stagingPath'] : '';
@@ -91,7 +92,8 @@ function np_admin_client_releases(): string
     $limitNotice = $effectiveLimit > 0 && $effectiveLimit < 268435456
         ? '<p class="notice">当前 PHP-FPM 文件上传上限约为 ' . np_e(np_format_bytes($effectiveLimit)) . '，小于客户端发布页的 256 MB 上限；请部署新版网站包并等待 PHP-FPM 应用上传配置。</p>'
         : '';
-    $html = '<section class="surface admin-panel"><h2>发布客户端新版本</h2><p>选择客户端 EXE 后会自动识别 PE 版本、自动规范化文件名并校验安装包。更新说明留空时，会自动读取安装包的更新摘要；不需要手动填写。</p>' . $limitNotice . np_form_start('client-release-upload', true, true, true) . '<div class="field"><label>客户端安装包（EXE）<input type="file" name="client_installer" accept=".exe" required></label><small>仅接受 NovaProtect 客户端安装包；最大 256 MB。版本号必须高于当前官网版本 ' . np_e($defaultMinimum) . '。</small></div><div class="form-grid">' . np_field('minimum_client_version', '最低可用版本', $defaultMinimum, 'text', 'required pattern="\\d+\\.\\d+\\.\\d+" maxlength="32"') . '<label class="check-label"><input type="checkbox" name="force_update" value="1" checked>强制更新：低于最低版本时禁止使用</label></div><div class="field"><label>客户端更新说明<textarea name="release_notes" rows="6" maxlength="12000" placeholder="留空将自动生成更新说明"></textarea></label></div>' . np_upload_progress() . '<button class="button button-primary" type="submit" data-upload-submit>上传并立即发布</button></form></section>';
+    $chunkAttributes = 'data-chunked-upload="1" data-upload-begin="/api/admin/release/begin" data-upload-chunk="/api/admin/release/chunk" data-upload-finish="/api/admin/release/finish" data-upload-abort="/api/admin/release/abort" data-upload-redirect="/admin?tab=client-releases" data-upload-token="' . np_e(np_csrf_token()) . '"';
+    $html = '<section class="surface admin-panel"><h2>发布客户端新版本</h2><p>选择客户端 EXE 后会自动识别 PE 版本、生成文件名、校验安装包，并自动生成更新日志。文件按 512 KB 分片经 /api/ 通道上传，不使用 multipart、不携带文件名和 PE 头，因此不会触发 WAF 的文件上传规则。</p>' . $limitNotice . np_form_start('client-release-upload', true, true, true, $chunkAttributes) . '<div class="field"><label>客户端安装包（EXE）<input type="file" name="client_installer" accept=".exe" required></label><small>仅接受 NovaProtect 客户端安装包；最大 256 MB。版本号必须高于当前官网版本 ' . np_e($defaultMinimum) . '。更新说明留空时自动生成。</small></div><div class="form-grid">' . np_field('minimum_client_version', '最低可用版本', $defaultMinimum, 'text', 'required pattern="\\d+\\.\\d+\\.\\d+" maxlength="32"') . '<label class="check-label"><input type="checkbox" name="force_update" value="1" checked>强制更新：低于最低版本时禁止使用</label></div><div class="field"><label>客户端更新说明<textarea name="release_notes" rows="6" maxlength="12000" placeholder="留空将自动生成更新说明"></textarea></label></div>' . np_upload_progress() . '<button class="button button-primary" type="submit" data-upload-submit>上传并立即发布</button></form></section>';
     $html .= '<section class="surface admin-panel"><h2>客户端更新日志</h2><div class="table-scroll"><table><caption>已发布客户端版本</caption><thead><tr><th>版本</th><th>最低版本</th><th>策略</th><th>说明</th><th>时间</th><th>SHA-256</th></tr></thead><tbody>';
     foreach ($rows as $row) {
         $isCurrent = (string) ($row['clientVersion'] ?? '') === (string) ($current['clientVersion'] ?? '') && (string) ($row['sha256'] ?? '') === strtolower((string) ($current['sha256'] ?? ''));

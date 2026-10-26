@@ -4,6 +4,44 @@ namespace NovaProtect.UI.Services;
 
 public static class ProtectionPlanner
 {
+    // Conflicts come in two flavours: a handful of global ones that name the
+    // problem, and one per rule that fails the same check.  Listing a line per
+    // rule buries the actual problem under a wall of near-identical text, so
+    // the rule-level ones are counted and reported as a single line.
+    private sealed class ConflictCollector
+    {
+        private readonly List<string> _global = [];
+        private readonly Dictionary<string, (string Template, List<string> Names)> _grouped = [];
+        private readonly List<string> _target;
+
+        public ConflictCollector(List<string> target) => _target = target;
+
+        public void Add(string message) => _global.Add(message);
+
+        public void AddGrouped(string key, string template, string name)
+        {
+            if (!_grouped.TryGetValue(key, out var entry))
+            {
+                entry = (template, []);
+                _grouped[key] = entry;
+            }
+            entry.Names.Add(name);
+        }
+
+        public void Flush()
+        {
+            _target.Clear();
+            _target.AddRange(_global);
+            foreach (var (_, entry) in _grouped)
+            {
+                var count = entry.Names.Count;
+                _target.Add(count == 1
+                    ? entry.Template.Replace("{0}", entry.Names[0])
+                    : entry.Template.Replace("{0}", $"{count} 项"));
+            }
+        }
+    }
+
     public static BuildPlan Create(ProtectionOptions options, PeSummary? target)
     {
         var plan = new BuildPlan
@@ -15,6 +53,7 @@ public static class ProtectionPlanner
             Toolchain = target?.ToolchainDisplay ?? "未知 PE 工具链",
             ObjectRules = options.ObjectRules.Select(CloneRule).ToList()
         };
+        var conflicts = new ConflictCollector(plan.Conflicts);
 
         var nativeX64 = target is { IsValid: true, TargetArchitecture: ProtectionTargetArchitecture.X64, IsManaged: false };
         var nativeX86 = target is { IsValid: true, TargetArchitecture: ProtectionTargetArchitecture.X86, IsManaged: false };
@@ -27,6 +66,13 @@ public static class ProtectionPlanner
         AddRequest(plan, options.PackSections, "区段打包");
         AddRequest(plan, options.EncryptSections, "区段加密");
         AddRequest(plan, vmRequested, $"marker VM {options.VmComplexity}");
+        // Revirtualization is x64-only and depends on the VM being enabled: the
+        // stage splitter and guest lifter operate on the wire program that only
+        // exists once a region has been lowered. Reporting it as requested on a
+        // non-x64 target would promise something the engine cannot run.
+        var revirtRequested = vmRequested && nativeX64 && options.EnableRevirtualization
+                              && options.RevirtualizationLevel > 0;
+        AddRequest(plan, revirtRequested, $"二次虚拟化 level {options.RevirtualizationLevel}");
         AddRequest(plan, mutationRequested, $"marker 变异 {options.MutationStrength}");
         AddRequest(plan, options.ImportProtection, "导入虚拟化");
         AddRequest(plan, options.ResourceProtection, "资源保护");
@@ -44,25 +90,29 @@ public static class ProtectionPlanner
 
         if (target is null || !target.IsValid)
         {
-            plan.Conflicts.Add("尚未选择有效 PE 目标");
+            conflicts.Add("尚未选择有效 PE 目标");
+            conflicts.Flush();
             return plan;
         }
 
         if (target.TargetArchitecture == ProtectionTargetArchitecture.Arm64)
         {
-            plan.Conflicts.Add("当前保护核心没有 ARM64 loader；拒绝生成伪兼容输出");
+            conflicts.Add("当前保护核心没有 ARM64 loader；拒绝生成伪兼容输出");
+            conflicts.Flush();
             return plan;
         }
 
         if (target.IsManaged && target.IsDll)
         {
-            plan.Conflicts.Add("当前版本只接受 C#/VB .NET EXE；托管 DLL 不进入 EXE 保护封装流程");
+            conflicts.Add("当前版本只接受 C#/VB .NET EXE；托管 DLL 不进入 EXE 保护封装流程");
+            conflicts.Flush();
             return plan;
         }
 
         if (!supportedPe)
         {
-            plan.Conflicts.Add("当前保护核心只接受 x86/x64 EXE（C/C++、C#/VB .NET、Rust、Golang）");
+            conflicts.Add("当前保护核心只接受 x86/x64 EXE（C/C++、C#/VB .NET、Rust、Golang）");
+            conflicts.Flush();
             return plan;
         }
 
@@ -81,6 +131,7 @@ public static class ProtectionPlanner
             if (vmRequested || mutationRequested) plan.Skipped.Add("marker VM/变异与函数 VM（仅原生 x64）");
             if (!string.IsNullOrWhiteSpace(options.LicenseKey)) plan.Skipped.Add("运行时许可（CLR 封装启动器尚未接入许可解释器）");
             if (!string.IsNullOrWhiteSpace(options.ActivationBinding)) plan.Skipped.Add("激活/硬件绑定（CLR 封装启动器尚未接入）");
+            conflicts.Flush();
             return plan;
         }
 
@@ -94,12 +145,12 @@ public static class ProtectionPlanner
         AddEffective(plan, options.StripDebugInfo, "调试目录裁剪");
         if (options.StripExports)
         {
-            if (target.IsDll) plan.Conflicts.Add("DLL 导出裁剪会移除对外入口，当前目标是 DLL");
+            if (target.IsDll) conflicts.Add("DLL 导出裁剪会移除对外入口，当前目标是 DLL");
             else plan.Effective.Add("导出裁剪");
         }
         if (options.StripRelocations)
         {
-            if (target.IsDll) plan.Conflicts.Add("DLL 不能可靠固定到首选基址，禁止裁剪重定位");
+            if (target.IsDll) conflicts.Add("DLL 不能可靠固定到首选基址，禁止裁剪重定位");
             else plan.Effective.Add("重定位裁剪并关闭 ASLR");
         }
 
@@ -147,8 +198,8 @@ public static class ProtectionPlanner
             if (vmRequested) plan.Skipped.Add("marker VM（仅原生 x64）");
             if (mutationRequested) plan.Skipped.Add("marker 变异（仅原生 x64 VM 管线）");
             AddEffective(plan, options.MemoryProtection, "x86 loader 内存完整性");
-            if (!string.IsNullOrWhiteSpace(options.LicenseKey)) plan.Conflicts.Add("运行时许可仅支持原生 x64");
-            if (!string.IsNullOrWhiteSpace(options.ActivationBinding)) plan.Conflicts.Add("激活/硬件绑定仅支持原生 x64");
+            if (!string.IsNullOrWhiteSpace(options.LicenseKey)) conflicts.Add("运行时许可仅支持原生 x64");
+            if (!string.IsNullOrWhiteSpace(options.ActivationBinding)) conflicts.Add("激活/硬件绑定仅支持原生 x64");
             AddEffective(plan, options.AntiDebugLevel > 0, $"x86 loader 反调试 {options.AntiDebugLevel}");
             AddEffective(plan, options.AntiVmLevel > 0, $"x86 loader 环境检查 {options.AntiVmLevel}");
         }
@@ -161,25 +212,27 @@ public static class ProtectionPlanner
                 // packer re-validates the range and falls back to native code
                 // for anything the VM translator cannot lower.
                 if (!string.Equals(rule.DetectorVersion, ProductInfo.FunctionDetectorVersion, StringComparison.Ordinal))
-                    plan.Conflicts.Add($"函数规则 {rule.Name} 不是受信任的函数扫描来源");
+                    conflicts.AddGrouped("fn-untrusted", "函数规则 {0} 不是受信任的函数扫描来源", rule.Name);
                 if (rule.EndRva <= rule.StartRva)
-                    plan.Conflicts.Add($"函数规则 {rule.Name} 的 RVA 范围无效");
+                    conflicts.AddGrouped("fn-range", "函数规则 {0} 的 RVA 范围无效", rule.Name);
                 if (rule.Mode is MarkerProtectionMode.Virtualization or MarkerProtectionMode.Ultra && !vmRequested)
-                    plan.Conflicts.Add($"函数规则 {rule.Name} 请求 VM，但全局模式未启用虚拟化");
+                    conflicts.AddGrouped("fn-vm", "函数规则 {0} 请求 VM，但全局模式未启用虚拟化", rule.Name);
                 if (rule.LockToActivation && string.IsNullOrWhiteSpace(options.ActivationBinding))
-                    plan.Conflicts.Add($"函数规则 {rule.Name} 请求激活锁定，但未配置激活绑定");
+                    conflicts.AddGrouped("fn-activation", "函数规则 {0} 请求激活锁定，但未配置激活绑定", rule.Name);
                 continue;
             }
             if (!string.Equals(rule.Source, ProductInfo.MarkerSource, StringComparison.Ordinal) ||
                 !string.Equals(rule.DetectorVersion, ProductInfo.MarkerDetectorVersion, StringComparison.Ordinal))
-                plan.Conflicts.Add($"对象规则 {rule.Name} 不是受信任的 NovaProtect SDK marker 来源");
+                conflicts.AddGrouped("obj-untrusted", "对象规则 {0} 不是受信任的 NovaProtect SDK marker 来源", rule.Name);
             if (!target.Markers.Any(m => m.StartRva == rule.StartRva && m.EndRva == rule.EndRva))
-                plan.Conflicts.Add($"对象规则 {rule.Name} 不匹配当前文件 marker");
+                conflicts.AddGrouped("obj-marker", "对象规则 {0} 不匹配当前文件 marker", rule.Name);
             if (rule.Mode is MarkerProtectionMode.Virtualization or MarkerProtectionMode.Ultra && !vmRequested)
-                plan.Conflicts.Add($"对象规则 {rule.Name} 请求 VM，但全局模式未启用虚拟化");
+                conflicts.AddGrouped("obj-vm", "对象规则 {0} 请求 VM，但全局模式未启用虚拟化", rule.Name);
             if (rule.LockToActivation && string.IsNullOrWhiteSpace(options.ActivationBinding))
-                plan.Conflicts.Add($"对象规则 {rule.Name} 请求激活锁定，但未配置激活绑定");
+                conflicts.AddGrouped("obj-activation", "对象规则 {0} 请求激活锁定，但未配置激活绑定", rule.Name);
         }
+
+        conflicts.Flush();
 
         if (plan.Effective.Count == 0 && plan.Conflicts.Count == 0)
             plan.Effective.Add("PE 结构重建");
@@ -227,34 +280,6 @@ public static class ProtectionPlanner
             [new(".NET DLL", CapabilityState.Unsupported, "当前版本仅支持 EXE 输入")],
             _ => [new("未知架构", CapabilityState.Unsupported, "当前核心不支持")]
         };
-    }
-
-    public static IReadOnlyList<ArchitectureCapabilityRow> FullMatrixFor(PeSummary? target)
-    {
-        var current = target is null
-            ? "尚未选择目标；下表显示当前核心的静态能力边界。"
-            : $"当前目标：{target.Architecture} · {target.Kind}；SDK marker {target.Markers.Count} 个。";
-        var trimNote = target?.IsDll == true
-            ? "当前目标是 DLL：重定位与导出裁剪均为阻断冲突。"
-            : "裁剪列描述原生 EXE；DLL 会被规划器和 CLI 阻止。";
-
-        return
-        [
-            new("PE 识别/检查", "✓", "✓", "只读识别", "只读识别", current),
-            new("EXE 输入", "✓ C/C++ · Rust · Go", "✓ C/C++ · Rust · Go", "只读识别", "✓ C#/VB 封装", "语言由 PE/CLR 与构建指纹识别；未知原生工具链按通用原生 PE 处理。"),
-            new("区段打包/加密", "✓", "✓", "✕ 无 loader", "✓ CLR 安全封装", "原生 x86/x64 使用 loader；.NET EXE 不重写 CLR 元数据。"),
-            new("SDK marker 对象编辑", "✓ 识别/编辑", "✓ 识别/编辑", "✕", "✕", "对象只来自 NovaProtect SDK marker 字节边界，不扫描任意函数。"),
-            new("marker VM / Ultra", "✕", "✓", "✕", "✕", "当前 VM translator、descriptor 与 interpreter 仅支持原生 x64。"),
-            new("VM 前置变异", "✕", "✓", "✕", "✕", "仅应用于成功翻译的 x64 marker VM 区域。"),
-            new("导入虚拟化", "✓", "✓", "✕", "✕", "剥离 loader 可见 Import Directory，并在运行时重建 IAT。"),
-            new("内存完整性", "✓ loader", "✓ loader/runtime", "✕", "✕", "x86/x64 均验证恢复后的 region；x64 另有 protection runtime 完整性表。"),
-            new("反调试/环境检查", "✓ loader", "✓ loader/runtime", "✕", "✕", "能力按架构走不同运行时路径。"),
-            new("反沙箱/反转储/桌面自检", "✕", "✓ runtime", "✕", "✕", "反微步云沙箱评分、内存转储自检与交互桌面环境检查，打包时独立开关。"),
-            new("运行时许可/激活", "✕", "✓", "✕", "✕", "激活绑定为 x64 进程级前置校验。"),
-            new("重定位裁剪", "△ EXE", "△ EXE", "✕", "✕", trimNote),
-            new("导出裁剪", "✓ EXE", "✓ EXE", "✕", "✕", trimNote),
-            new("项目/构建计划持久化", "✓", "✓", "✓ 配置", "✓ 配置", "不支持构建的目标仍可保存项目和冲突计划，但不会生成伪兼容输出。")
-        ];
     }
 
     private static ProtectionObjectRule CloneRule(ProtectionObjectRule source) => new()

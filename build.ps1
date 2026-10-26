@@ -36,8 +36,16 @@ if ($vmpResolve -match 'NOVAPROTECT_VMP_DLL=(.+)') { $vmpSdkRuntime = $Matches[1
 $vmpDefine = ''
 $vmpLink = @()
 if ($vmpSdkLibrary -ne '' -and (Test-Path -LiteralPath $vmpSdkLibrary)) {
-  $vmpLink = @($vmpSdkLibrary)
-  Write-Host "[vmp] linking VMProtect SDK import library: $vmpSdkLibrary"
+  # Hand the linker a workspace-relative path. The checkout lives under
+  # non-ASCII directory names, and an absolute path gets re-encoded through the
+  # OEM code page when the compiler child process receives it, which makes ld
+  # report "cannot find <mojibake>.a" for a file that is plainly there.
+  $vmpRel = $vmpSdkLibrary
+  if ($vmpRel.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+    $vmpRel = '.' + $vmpRel.Substring($root.Length)
+  }
+  $vmpLink = @($vmpRel)
+  Write-Host "[vmp] linking VMProtect SDK import library: $vmpRel"
 } else {
   $vmpDefine = '-DNOVAPROTECT_VMP_STUB'
   Write-Host '[vmp] VMProtect SDK not found; building with no-op SDK markers (NOVAPROTECT_VMP_STUB)'
@@ -248,9 +256,15 @@ function Build-Cli {
   & windres.exe runtime\novaprotect_cli.rc -O coff -o runtime\novaprotect_cli.res
   if ($LASTEXITCODE -ne 0) { throw 'cli resource build failed' }
   $vmpArgs = @(); if ($vmpDefine -ne "") { $vmpArgs += $vmpDefine }
-  & g++.exe -std=c++17 -O2 -municode @vmpArgs -o NovaProtect.Engine.exe src\main.cpp src\client_gate.cpp src\managed_envelope.cpp src\pe_lib.cpp src\packer.cpp src\packer_meta.cpp src\mutation.cpp src\disasm.cpp src\anti_debug.cpp src\vm_engine.cpp src\vm_obfuscate.cpp src\crypto_layers.cpp runtime\novaprotect_cli.res @vmpLink -Iinclude -Isrc -static -static-libgcc -static-libstdc++ -lbcrypt
+  & g++.exe -std=c++17 -O2 -municode @vmpArgs -o NovaProtect.Engine.exe src\main.cpp src\client_gate.cpp src\managed_envelope.cpp src\pe_lib.cpp src\packer.cpp src\packer_meta.cpp src\mutation.cpp src\disasm.cpp src\anti_debug.cpp src\vm_engine.cpp src\vm_obfuscate.cpp src\vm_revirt.cpp src\crypto_layers.cpp src\crypto_stream.cpp runtime\novaprotect_cli.res @vmpLink -Iinclude -Isrc -static -static-libgcc -static-libstdc++ -lbcrypt
   if ($LASTEXITCODE -ne 0) { throw 'cli build failed' }
   Write-Host '[cli] ok'
+  # The engine links the commercial VMProtect SDK, so its runtime DLL has to
+  # sit next to the binary - otherwise the engine fails to start with
+  # STATUS_DLL_NOT_FOUND before it can do any work.
+  if ($vmpSdkRuntime -and (Test-Path -LiteralPath $vmpSdkRuntime)) {
+    Copy-Item -LiteralPath $vmpSdkRuntime -Destination (Join-Path $root 'VMProtectSDK64.dll') -Force
+  }
   Pop-Location
 }
 
@@ -263,6 +277,10 @@ function Build-ManagedHost {
   & g++.exe -std=c++17 -O2 -municode @vmpArgs -o NovaProtect.ManagedHost.exe runtime\managed_host.cpp runtime\managed_host.res @vmpLink -static -static-libgcc -static-libstdc++
   if ($LASTEXITCODE -ne 0) { throw 'managed host build failed' }
   Write-Host '[managed-host] ok'
+  # Same as the engine: the SDK runtime belongs next to the binary.
+  if ($vmpSdkRuntime -and (Test-Path -LiteralPath $vmpSdkRuntime)) {
+    Copy-Item -LiteralPath $vmpSdkRuntime -Destination (Join-Path $root 'VMProtectSDK64.dll') -Force
+  }
   Pop-Location
 }
 

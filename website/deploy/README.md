@@ -46,7 +46,7 @@ artifacts/website-full/<version>/NovaProtect-Website-<version>-Linux-x64-BaoTa-F
 artifacts/website-upgrade/<version>/NovaProtect-Website-<version>-Linux-x64-BaoTa-Upgrade.zip
 ```
 
-已有网站只上传 `website-upgrade` 下的精简升级 ZIP。它只包含升级所需的 PHP、资源、迁移脚本、清单和客户端下载文件，不含 `install.sh`、`deploy/install.sh` 或 Nginx 初始配置，不能用于首次安装：
+已有网站只上传 `website-upgrade` 下的精简升级 ZIP。它只包含升级所需的 PHP、资源、迁移脚本和清单，不含 `install.sh`、`deploy/install.sh` 或 Nginx 初始配置，不能用于首次安装；也**不包含客户端安装包**——升级时复用 `/www/server/novaprotect/downloads/` 里已有的那份，并按 `release.json` 的 SHA-256 校验，缺失或不符会中止升级。整包因此只有 1 MB 左右：
 
 ```bash
 bash upgrade.sh --check-package
@@ -61,9 +61,9 @@ bash upgrade.sh
 
 ## 管理后台上传升级包
 
-管理员可以在“管理后台 → 版本与升级”上传精简升级 ZIP。上传流程只在 PHP-FPM 内做安全校验和暂存，不直接执行 root 命令。服务器首次安装或升级后会启用 `novaprotect-upgrade-executor.timer`；校验通过后，在已上传包的记录中点击“一键升级”，由 root 执行器自动复核、备份、迁移、健康检查并回滚。后台会持续显示排队、执行中、完成或失败状态，不需要手动复制命令。
+管理员可以在“管理后台 → 版本与升级”上传精简升级 ZIP。上传流程只在 PHP-FPM 内做安全校验和暂存，不直接执行 root 命令。ZIP 与客户端安装包走同一条分片通道：浏览器切成 512 KB 分片、以 base64 文本 POST 到 `/api/admin/release/*`，报文不含 multipart、文件名和 ZIP 本地头，因此不会触发 WAF。服务器首次安装或升级后会启用 `novaprotect-upgrade-executor.timer`；校验通过后，在已上传包的记录中点击“一键升级”，由 root 执行器自动复核、备份、迁移、健康检查并回滚。后台会持续显示排队、执行中、完成或失败状态，不需要手动复制命令。
 
-包会保存到 `/www/server/novaprotect/updates/<version>/<upload-id>/`，不在网站公开目录。管理员上传客户端或升级 ZIP 时，网站会为 PHP-FPM 设置 `upload_max_filesize=256M`、`post_max_size=260M`；Nginx 只在 `/admin` 上传路由放宽到 `260M`。`.user.ini` 默认最多 5 分钟生效。如果仍提示限制过小，请检查 PHP 8.4 的 `user_ini.filename` 没有被禁用，并确认 Nginx 与 PHP-FPM 已加载新网站包配置。
+包会保存到 `/www/server/novaprotect/updates/<version>/<upload-id>/`，不在网站公开目录。管理员上传客户端或升级 ZIP 时，网站会为 PHP-FPM 设置 `upload_max_filesize=256M`、`post_max_size=260M`；Nginx 对分片通道 `/api/` 只放行 `4m`（单个分片约 683 KB），对 `/admin` 保留 `260M` 作为无 JavaScript 时 multipart 回退。`.user.ini` 默认最多 5 分钟生效。如果仍提示限制过小，请检查 PHP 8.4 的 `user_ini.filename` 没有被禁用，并确认 Nginx 与 PHP-FPM 已加载新网站包配置。
 
 ## 管理后台手动发布客户端
 

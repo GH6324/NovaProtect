@@ -29,20 +29,22 @@ bash deploy/rollback.sh
 
 ## 离线升级
 
-已有网站使用 `artifacts/website-upgrade/2.2.16/` 下的精简升级 ZIP。该包不包含 `install.sh`、`deploy/install.sh` 或首次安装 Nginx 配置，只能在已安装站点上执行：
+已有网站使用 `artifacts/website-upgrade/2.2.20/` 下的精简升级 ZIP。该包不包含 `install.sh`、`deploy/install.sh` 或首次安装 Nginx 配置，也**不再重复打包客户端安装包**（约 60 MB），只能在已安装站点上执行：
 
 ```bash
 bash upgrade.sh --check-package
 bash upgrade.sh
 ```
 
+升级包只有 1 MB 左右。客户端安装包复用服务器 `/www/server/novaprotect/downloads/` 里已有的那一份，`upgrade.sh` 会先按 `release.json` 的 SHA-256 校验；若服务器上缺失或哈希不符，脚本会直接中止并提示改用完整包，不会带着错误状态往下走。
+
 每次发布同时保留完整包和升级包，分别位于 `artifacts/website-full/<version>/` 与 `artifacts/website-upgrade/<version>/`；旧的单包输出路径不再生成。
 
 ## 管理后台上传离线升级包
 
-管理员在 `/admin/login` 输入口令后打开“管理后台 → 版本与升级”，上传 `website-upgrade/<version>/` 下的精简 ZIP。上传表单会显示实时进度，文件发送完成后继续显示服务器校验状态。网站会校验 `packageType=upgrade`、版本递增、ZIP 路径安全、`SHA256SUMS` 全量覆盖、客户端安装包哈希，以及完整安装入口是否被错误带入。通过后包保存在 `/www/server/novaprotect/updates/<version>/<upload-id>/`，不进入 Web 根目录；后台显示 root 执行命令，PHP-FPM 不直接执行 root 升级。
+管理员在 `/admin/login` 输入口令后打开“管理后台 → 版本与升级”，上传 `website-upgrade/<version>/` 下的精简 ZIP。ZIP 与客户端安装包走同一条 512 KB 分片通道（`/api/admin/release/*`，base64 文本、无 multipart、无文件名、无 ZIP 本地头），同样不触发 WAF；上传表单会显示实时进度，文件发送完成后继续显示服务器校验状态。网站会校验 `packageType=upgrade`、版本递增、ZIP 路径安全、`SHA256SUMS` 全量覆盖、客户端安装包哈希（包内带有时才校验），以及完整安装入口是否被错误带入。通过后包保存在 `/www/server/novaprotect/updates/<version>/<upload-id>/`，不进入 Web 根目录；后台显示 root 执行命令，PHP-FPM 不直接执行 root 升级。
 
-客户端发布页可直接选取 EXE 文件。服务器会从 PE 版本资源读取客户端版本、自动规范化存储文件名，并从 PE 描述生成更新说明；新文件的版本必须高于当前发布版本。PHP-FPM 的每站点上传上限为 256 MB，部署包会自动写入 Nginx/PHP 上传配置；PHP-FPM 默认最多 5 分钟刷新 `.user.ini`。
+客户端发布页可直接选取 EXE 文件。浏览器把安装包切成 512 KB 分片，每片以 `NPCHUNK1:` 前缀 + base64 文本 POST 到 `/api/admin/release/{begin,chunk,finish}`，请求里没有 multipart、没有文件名、没有 PE 头，因此不会命中 WAF 的文件上传规则和超大请求体规则；单个分片失败会自动重试。服务器重新拼装后从 PE 版本资源读取客户端版本、生成规范存储文件名，并把安装包内的更新摘要展开成结构化更新日志（需要更详细的文案时可用 `client-release-notes.json` 按版本覆盖）。新文件的版本必须高于当前发布版本。Nginx 对 `/api/` 放行 4 MB 请求体，`/admin` 保留 256 MB 的旧 multipart 回退通道；PHP-FPM 默认最多 5 分钟刷新 `.user.ini`。
 
 服务器首次安装或升级后会启用 `novaprotect-upgrade-executor.timer`。上传校验通过后，点击已上传记录中的“一键升级”；root 执行器会自动复核、备份、迁移、健康检查并在失败时回滚，后台会显示排队、执行中、完成或失败状态。
 

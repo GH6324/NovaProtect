@@ -24,6 +24,7 @@ if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) { throw "Missin
 $required = @(
   (Join-Path $website 'app\bootstrap.php'),
   (Join-Path $website 'app\features.php'),
+  (Join-Path $website 'app\upload.php'),
   (Join-Path $website 'app\site.php'),
   (Join-Path $website 'app\portal.php'),
   (Join-Path $website 'app\view.php'),
@@ -75,15 +76,21 @@ function Write-Utf8([string]$Path, [string]$Content) {
 function Write-PackageMetadata([string]$Bundle, [ValidateSet('full', 'upgrade')][string]$Kind) {
   $purpose = if ($Kind -eq 'full') { 'initial-install-and-recovery' } else { 'offline-upgrade' }
   $entryPoints = if ($Kind -eq 'full') { @('install.sh', 'upgrade.sh') } else { @('upgrade.sh') }
-  $metadata = [ordered]@{
-    product = 'NovaProtect'
-    packageType = $Kind
-    purpose = $purpose
-    websiteVersion = $version
-    clientVersion = [string]$release.clientVersion
-    entryPoints = $entryPoints
-  }
-  Write-Utf8 (Join-Path $Bundle 'package.json') (($metadata | ConvertTo-Json -Depth 5) + "`n")
+  # ConvertTo-Json in PowerShell 5.1 serialises a one-element array as a bare
+  # string, which the PHP upgrade validator reads as an invalid entry-point
+  # contract. Emit the array by hand so entryPoints is always a JSON array.
+  $entryJson = '[' + ((@($entryPoints) | ForEach-Object { '"' + $_ + '"' }) -join ', ') + ']'
+  $metadata = @"
+{
+    "product":  "NovaProtect",
+    "packageType":  "$Kind",
+    "purpose":  "$purpose",
+    "websiteVersion":  "$version",
+    "clientVersion":  "$([string]$release.clientVersion)",
+    "entryPoints":  $entryJson
+}
+"@
+  Write-Utf8 (Join-Path $Bundle 'package.json') ($metadata + "`n")
 }
 
 function Write-Manifest([string]$Bundle) {
@@ -117,7 +124,7 @@ function New-WebsitePackage([ValidateSet('Full', 'Upgrade')][string]$Kind, [stri
     New-Item -ItemType Directory -Force -Path $bundle, (Split-Path -Parent $OutputPath) | Out-Null
     Copy-Tree (Join-Path $website 'app') (Join-Path $bundle 'app')
     Copy-Tree (Join-Path $website 'public') (Join-Path $bundle 'public')
-    New-Item -ItemType Directory -Force -Path (Join-Path $bundle 'deploy'), (Join-Path $bundle 'downloads') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $bundle 'deploy') | Out-Null
 
     foreach ($name in @('upgrade.sh','migrate.php','reset-admin-password.php','rollback.sh','health-check.sh','upgrade-executor.sh','novaprotect-upgrade-executor.service','novaprotect-upgrade-executor.timer','cdnfly-edge-policy.json','cdnfly-check.sh','CDNFLY.md','README.md','configure_nginx.py','nginx-location.conf')) {
       Copy-Item -LiteralPath (Join-Path $website "deploy\$name") -Destination (Join-Path $bundle "deploy\$name") -Force
@@ -125,7 +132,13 @@ function New-WebsitePackage([ValidateSet('Full', 'Upgrade')][string]$Kind, [stri
     Copy-Item -LiteralPath (Join-Path $website 'upgrade.sh') -Destination (Join-Path $bundle 'upgrade.sh') -Force
     Copy-Item -LiteralPath $releasePath -Destination (Join-Path $bundle 'release.json') -Force
     Copy-Item -LiteralPath (Join-Path $website 'VERSION') -Destination (Join-Path $bundle 'VERSION') -Force
-    Copy-Item -LiteralPath $InstallerPath -Destination (Join-Path $bundle ("downloads\$clientFile")) -Force
+    # Only the full package seeds the download store. An upgrade archive stays
+    # slim (~1 MB) and reuses the client installer already on the server;
+    # deploy/upgrade.sh verifies that copy against release.json.
+    if ($Kind -eq 'Full') {
+      New-Item -ItemType Directory -Force -Path (Join-Path $bundle 'downloads') | Out-Null
+      Copy-Item -LiteralPath $InstallerPath -Destination (Join-Path $bundle ("downloads\$clientFile")) -Force
+    }
     Copy-Item -LiteralPath (Join-Path $website 'deploy\README.md') -Destination (Join-Path $bundle 'README.md') -Force
 
     if ($Kind -eq 'Full') {

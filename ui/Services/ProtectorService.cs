@@ -37,6 +37,13 @@ public sealed partial class ProtectorService
         });
         Add(start, "-mut", options.MutationStrength.ToString());
         Add(start, "-vm", options.VmComplexity.ToString());
+        // Only emitted when the user turned it off. The core defaults to on, so
+        // passing the flag is the exception; passing "-norevirtualization"
+        // explicitly keeps the intent visible in the argument log instead of
+        // relying on a default that could change.
+        Flag(start, !options.EnableRevirtualization || options.RevirtualizationLevel <= 0, "-norevirtualization");
+        if (options.EnableRevirtualization && options.RevirtualizationLevel > 0)
+            Add(start, "-revirt-level", options.RevirtualizationLevel.ToString());
         Add(start, "-ad", options.AntiDebugLevel.ToString());
         Add(start, "-avm", options.AntiVmLevel.ToString());
 
@@ -54,6 +61,13 @@ public sealed partial class ProtectorService
         AddOptional(start, "-watermark", options.Watermark);
         AddOptional(start, "-license", options.LicenseKey);
         AddOptional(start, "-activation", options.ActivationBinding);
+
+        // Windows caps the command line at 32767 characters. Passing one
+        // argument per selected function blows that limit as soon as a few
+        // hundred functions are checked, and the engine then never starts.
+        // Rules therefore go through a file, which has no such ceiling.
+        var functionRules = new List<string>();
+        var markerRules = new List<string>();
         foreach (var rule in options.ObjectRules)
         {
             if (string.Equals(rule.Source, ProductInfo.FunctionSource, StringComparison.Ordinal) &&
@@ -61,20 +75,42 @@ public sealed partial class ProtectorService
             {
                 // Scanned function: the RVA range is the whole function body,
                 // so the packer lowers it directly (no marker wrapping).
-                Add(start, "-func", $"{rule.StartRva:X}-{rule.EndRva:X}-{ModeName(rule.Mode)}-{rule.VmComplexity}-{rule.MutationStrength}-{(rule.LockToActivation ? 1 : 0)}");
+                functionRules.Add($"{rule.StartRva:X}-{rule.EndRva:X}-{ModeName(rule.Mode)}-{rule.VmComplexity}-{rule.MutationStrength}-{(rule.LockToActivation ? 1 : 0)}");
                 continue;
             }
             if (!string.Equals(rule.Source, ProductInfo.MarkerSource, StringComparison.Ordinal) ||
                 !string.Equals(rule.DetectorVersion, ProductInfo.MarkerDetectorVersion, StringComparison.Ordinal))
                 throw new InvalidOperationException($"对象规则 {rule.Name} 不是由 NovaProtect SDK marker 检测器生成");
-            Add(start, "-region", $"{rule.StartRva:X}-{rule.EndRva:X}-{ModeName(rule.Mode)}-{rule.VmComplexity}-{rule.MutationStrength}-{(rule.LockToActivation ? 1 : 0)}");
+            markerRules.Add($"{rule.StartRva:X}-{rule.EndRva:X}-{ModeName(rule.Mode)}-{rule.VmComplexity}-{rule.MutationStrength}-{(rule.LockToActivation ? 1 : 0)}");
         }
+
+        string? functionRuleFile = null;
+        string? markerRuleFile = null;
+        try
+        {
+            if (functionRules.Count > 0)
+            {
+                functionRuleFile = WriteRuleFile(functionRules);
+                Add(start, "-funcfile", functionRuleFile);
+            }
+            if (markerRules.Count > 0)
+            {
+                markerRuleFile = WriteRuleFile(markerRules);
+                Add(start, "-regionfile", markerRuleFile);
+            }
+        }
+        catch
+        {
+            DeleteRuleFile(functionRuleFile);
+            DeleteRuleFile(markerRuleFile);
+            throw;
+        }
+
         foreach (var virtualFile in options.VirtualFiles) Add(start, "-vf", virtualFile);
 
         using var process = new Process { StartInfo = start, EnableRaisingEvents = true };
         var recent = new Queue<string>();
         var started = false;
-
         void Handle(string? line)
         {
             if (string.IsNullOrWhiteSpace(line)) return;
@@ -136,6 +172,26 @@ public sealed partial class ProtectorService
             var exitCode = started && process.HasExited ? process.ExitCode : -1;
             return new ProtectionRunResult(false, exitCode, summary);
         }
+        finally
+        {
+            DeleteRuleFile(functionRuleFile);
+            DeleteRuleFile(markerRuleFile);
+        }
+    }
+
+    // Write region rules to a temporary file. The content is pure ASCII
+    // (hexadecimal RVAs and fixed keywords), so the encoding never matters.
+    private static string WriteRuleFile(IReadOnlyList<string> rules)
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"novaprotect-rules-{Guid.NewGuid():N}.txt");
+        File.WriteAllLines(path, rules, new UTF8Encoding(false));
+        return path;
+    }
+
+    private static void DeleteRuleFile(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return;
+        try { File.Delete(path); } catch { }
     }
 
     public async Task<(bool Success, string Output)> InspectAsync(string path, params string[] command)
@@ -188,6 +244,7 @@ public sealed partial class ProtectorService
     {
         MarkerProtectionMode.Skip => "skip",
         MarkerProtectionMode.Virtualization => "virtualization",
+        MarkerProtectionMode.Mutation => "mutation",
         MarkerProtectionMode.Ultra => "ultra",
         _ => "inherit"
     };

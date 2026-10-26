@@ -46,12 +46,18 @@ try {
   if ($metadataType -notin @('full', 'upgrade')) { throw "Invalid package.json packageType: $metadataType" }
   if ([string]$metadata.product -ne 'NovaProtect') { throw 'Invalid package.json product' }
   if ([string]$metadata.websiteVersion -ne $version) { throw 'package.json websiteVersion mismatch' }
+  # PowerShell 5.1 ConvertTo-Json writes a one-element array as a scalar. The
+  # PHP upgrade validator requires entryPoints to be a JSON array, so guard the
+  # raw text instead of trusting the round-tripped object.
+  if ((Read-EntryText 'package.json') -match '"entryPoints"\s*:\s*"') { throw 'package.json entryPoints collapsed to a scalar instead of a JSON array' }
+  $expectedEntryPoints = if ($metadataType -eq 'full') { @('install.sh', 'upgrade.sh') } else { @('upgrade.sh') }
+  if ((@($metadata.entryPoints) -join ',') -ne ($expectedEntryPoints -join ',')) { throw "package.json entryPoints mismatch: $(@($metadata.entryPoints) -join ',')" }
   $actualType = if ($PackageType) { $PackageType.ToLowerInvariant() } else { $metadataType }
   if ($metadataType -ne $actualType) { throw "Package type mismatch: metadata=$metadataType requested=$actualType" }
 
   $required = @(
     'SHA256SUMS','VERSION','release.json','package.json','README.md','upgrade.sh',
-    'app/bootstrap.php','app/features.php','app/site.php','app/portal.php','app/view.php','app/version.json','public/index.php',
+    'app/bootstrap.php','app/features.php','app/upload.php','app/site.php','app/portal.php','app/view.php','app/version.json','public/index.php',
     'public/.user.ini','public/css/site.css','public/js/upload-progress.js','public/assets/novaprotect.png','public/favicon.ico',
     'deploy/upgrade.sh','deploy/migrate.php','deploy/reset-admin-password.php','deploy/rollback.sh','deploy/health-check.sh','deploy/upgrade-executor.sh','deploy/novaprotect-upgrade-executor.service','deploy/novaprotect-upgrade-executor.timer','deploy/configure_nginx.py','deploy/nginx-location.conf',
     'deploy/cdnfly-edge-policy.json','deploy/cdnfly-check.sh','deploy/CDNFLY.md'
@@ -60,12 +66,18 @@ try {
     $required += @('install.sh','deploy/install.sh','deploy/configure_nginx.py','deploy/nginx-location.conf','deploy/entry-install.sh')
   }
   foreach ($name in $required) { if (-not $entries.ContainsKey($name)) { throw "Missing package entry: $name" } }
-  if (-not ($entries.Keys | Where-Object { $_ -like 'downloads/*' })) { throw 'Missing downloads payload' }
+  # A full package must ship the client installer; a slim upgrade archive may
+  # rely on the copy already present in the server's download store.
+  if ($actualType -eq 'full' -and -not ($entries.Keys | Where-Object { $_ -like 'downloads/*' })) { throw 'Missing downloads payload' }
 
   if ($actualType -eq 'upgrade') {
     foreach ($forbidden in @('install.sh','deploy/install.sh','deploy/entry-install.sh')) {
       if ($entries.ContainsKey($forbidden)) { throw "Upgrade package contains full-install entry: $forbidden" }
     }
+    # An upgrade archive must stay slim: the client installer lives in the
+    # server's download store and upgrade.sh re-verifies it against release.json.
+    $bundledInstaller = $entries.Keys | Where-Object { $_ -like 'downloads/*' }
+    if ($bundledInstaller) { throw "Upgrade package must not bundle the client installer (found $($bundledInstaller -join ', '))" }
   }
 
   $release = Read-EntryText 'release.json' | ConvertFrom-Json
@@ -76,10 +88,13 @@ try {
   $clientFile = [string]$release.fileName
   if ($clientFile -notmatch '^NovaProtect-Setup-\d+\.\d+\.\d+\.exe$') { throw 'Invalid release filename' }
   $downloadEntry = "downloads/$clientFile"
-  if (-not $entries.ContainsKey($downloadEntry)) { throw "Missing package entry: $downloadEntry" }
   $expectedClientHash = ([string]$release.sha256).ToLowerInvariant()
   if ($expectedClientHash -notmatch '^[a-f0-9]{64}$') { throw 'Invalid release SHA-256' }
-  if ((Hash-Entry $downloadEntry) -ne $expectedClientHash) { throw 'Client installer hash does not match release.json' }
+  if ($entries.ContainsKey($downloadEntry)) {
+    if ((Hash-Entry $downloadEntry) -ne $expectedClientHash) { throw 'Client installer hash does not match release.json' }
+  } elseif ($actualType -eq 'full') {
+    throw "Missing package entry: $downloadEntry"
+  }
   $phpUploadConfig = Read-EntryText 'public/.user.ini'
   if ($phpUploadConfig -notmatch '(?m)^upload_max_filesize=256M$' -or $phpUploadConfig -notmatch '(?m)^post_max_size=260M$') { throw 'PHP-FPM upload limits are missing or too small' }
 
@@ -111,6 +126,11 @@ try {
   if ((Read-EntryText 'app/site.php') -notmatch [regex]::Escape($installWizardLabel)) { throw 'PHP install wizard is missing' }
   if ((Read-EntryText 'app/site.php') -notmatch 'action="/admin/login"') { throw 'Admin login form is missing' }
   if ((Read-EntryText 'app/features.php') -notmatch 'minimumClientVersion|forceUpdate|releaseNotes') { throw 'Client release upload contract is missing' }
+  $chunkedUpload = Read-EntryText 'app/upload.php'
+  if ($chunkedUpload -notmatch 'np_handle_release_upload_api') { throw 'Chunked upload transport is missing' }
+  if ($chunkedUpload -notmatch 'NP_UPLOAD_CHUNK_PREFIX') { throw 'Chunked upload lost its PE-signature-safe body prefix' }
+  if ((Read-EntryText 'public/js/upload-progress.js') -notmatch 'data-chunked-upload|data-upload-begin') { throw 'Chunked upload client script is missing' }
+  if ((Read-EntryText 'public/index.php') -notmatch '/api/admin/release/') { throw 'Chunked upload route is missing' }
   if ((Read-EntryText 'app/portal.php') -notmatch 'np_admin_client_releases|np_admin_upgrades') { throw 'Admin release panels are missing' }
   if ((Read-EntryText 'deploy/upgrade.sh') -notmatch 'UPGRADE-PACKAGE-CHECK-OK|maintenance\.json|MIGRATION-OK') { throw 'PHP offline upgrade flow is missing' }
   $resetTool = Read-EntryText 'deploy/reset-admin-password.php'
